@@ -207,6 +207,25 @@
     #printArea, #printArea *{visibility:visible;}
     #printArea{display:block;position:absolute;top:0;right:0;left:0;padding:20px;}
   }
+  /* ===== وثيقة إشعار التسجيل القابلة للطباعة ===== */
+  .slip-doc{position:relative;max-width:800px;margin:0 auto;font-family:'Segoe UI',Tahoma,Arial,sans-serif;direction:rtl;
+    border:3px double var(--navy);border-radius:10px;padding:26px 30px;overflow:hidden;background:#fff;}
+  .slip-watermark{position:absolute;inset:-20%;display:flex;flex-wrap:wrap;align-content:space-around;justify-content:space-around;
+    transform:rotate(-30deg);opacity:.07;pointer-events:none;z-index:0;}
+  .slip-watermark span{font-size:22px;font-weight:800;color:var(--navy);white-space:nowrap;margin:18px 26px;}
+  .slip-doc > *{position:relative;z-index:1;}
+  .slip-head{display:flex;align-items:center;gap:14px;border-bottom:2px solid var(--gold);padding-bottom:14px;margin-bottom:14px;}
+  .slip-head img{width:64px;height:64px;border-radius:50%;border:2px solid var(--gold);object-fit:cover;}
+  .slip-head .titles{flex:1;text-align:center;}
+  .slip-head .titles h2{margin:0 0 4px;color:var(--navy);font-size:19px;}
+  .slip-head .titles .sub{font-size:12px;color:var(--ink-soft);}
+  .slip-serial{font-size:11px;color:var(--ink-soft);text-align:left;}
+  .slip-id-block{display:grid;grid-template-columns:1fr 1fr;gap:8px 22px;background:var(--paper-2);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;}
+  .slip-id-block b{color:var(--navy);}
+  .slip-table{width:100%;border-collapse:collapse;margin-top:6px;}
+  .slip-table th{background:#EEF3EC;border:1px solid #ccc;padding:6px;font-size:12.5px;}
+  .slip-table td{border:1px solid #ccc;padding:6px;font-size:12.5px;}
+  .slip-foot{margin-top:20px;font-size:11px;color:var(--ink-soft);border-top:1px dashed var(--line);padding-top:10px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;}
 
   @media (max-width:640px){
     header.topbar{padding:10px 12px;}
@@ -357,6 +376,19 @@ const UNIV_LOGO_DATA_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAA
 
 /* ==================== أدوات عامة ==================== */
 function uid(){ return (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Date.now()+'-'+Math.random().toString(16).slice(2)); }
+/* تجزئة نصية بسيطة غير تشفيرية (FNV-1a مبسّطة) — تُستخدم فقط لتوليد رمز/رقم
+   مرجعي مختصر يبدو كرمز تحقّق على الوثائق المطبوعة (ليست حماية فعلية). */
+function simpleHash(str){
+  str = String(str||'');
+  let h = 0x811c9dc5;
+  for(let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h>>>0);
+}
+function docSerialCode(prefix, parts){
+  const h = simpleHash(parts.join('|')).toString(36).toUpperCase().padStart(6,'0').slice(-6);
+  const h2 = simpleHash(parts.join('|')+'#'+h).toString(36).toUpperCase().padStart(4,'0').slice(-4);
+  return `${prefix}-${h}-${h2}`;
+}
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleDateString('ar-EG',{year:'numeric',month:'2-digit',day:'2-digit'}); }catch(e){ return iso; } }
 function fmtDateTime(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString('ar-EG'); }catch(e){ return iso; } }
@@ -372,6 +404,149 @@ function csvField(v){
   const s = (v==null?'':String(v));
   return '"' + s.replace(/"/g,'""') + '"';
 }
+
+/* ==================== كاتب ملفات XLSX بسيط (بدون أي مكتبة خارجية) ====================
+   نظير مطابق لقارئ xlsx/zip الموجود أعلاه (parseXlsxFile/unzipEntries/inflateRaw)
+   لكن بالاتجاه المعاكس: يبني أرشيف ZIP بطريقة STORE (بدون ضغط، method=0) يحوي
+   حزمة OOXML دنيا صالحة يفتحها Excel مباشرة — بدون sharedStrings.xml (نستخدم
+   inlineStr لكل خلية نصية لتفادي أخطاء الفهرسة والإبقاء على الكود بسيطًا). */
+function crc32(bytes){
+  if(!crc32.__table){
+    const table = new Uint32Array(256);
+    for(let n=0;n<256;n++){
+      let c = n;
+      for(let k=0;k<8;k++){ c = (c&1) ? (0xEDB88320 ^ (c>>>1)) : (c>>>1); }
+      table[n] = c>>>0;
+    }
+    crc32.__table = table;
+  }
+  const table = crc32.__table;
+  let crc = 0xFFFFFFFF;
+  for(let i=0;i<bytes.length;i++){ crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8); }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+/* أرشيف ZIP بطريقة STORE (بدون ضغط) — تُطابق الحد الأدنى الذي يفهمه قارئ xlsx
+   الموجود أعلاه في هذا الملف: تواقيع PK صحيحة، رؤوس ملفات محلية + دليل مركزي
+   + سجل EOCD، وحجم مضغوط = حجم غير مضغوط (method=0). entries: [{name, data:Uint8Array}] */
+function buildZipStored(entries){
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const dosTime = 0, dosDate = 0x21; // تاريخ/وقت رمزي ثابت — غير مهم لصلاحية الملف
+  for(const entry of entries){
+    const nameBytes = encoder.encode(entry.name);
+    const data = entry.data;
+    const crc = crc32(data);
+    const size = data.length;
+
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);   // Local file header signature
+    lv.setUint16(4, 20, true);           // version needed
+    lv.setUint16(6, 0, true);            // flags
+    lv.setUint16(8, 0, true);            // method = 0 (STORE)
+    lv.setUint16(10, dosTime, true);
+    lv.setUint16(12, dosDate, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, size, true);        // compressed size
+    lv.setUint32(22, size, true);        // uncompressed size
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);           // extra length
+    localHeader.set(nameBytes, 30);
+
+    localParts.push(localHeader, data);
+    const localHeaderOffset = offset;
+    offset += localHeader.length + data.length;
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(centralHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);   // Central directory signature
+    cv.setUint16(4, 20, true);           // version made by
+    cv.setUint16(6, 20, true);           // version needed
+    cv.setUint16(8, 0, true);            // flags
+    cv.setUint16(10, 0, true);           // method = 0 (STORE)
+    cv.setUint16(12, dosTime, true);
+    cv.setUint16(14, dosDate, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, size, true);        // compressed size
+    cv.setUint32(24, size, true);        // uncompressed size
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);           // extra length
+    cv.setUint16(32, 0, true);           // comment length
+    cv.setUint16(34, 0, true);           // disk number start
+    cv.setUint16(36, 0, true);           // internal attrs
+    cv.setUint32(38, 0, true);           // external attrs
+    cv.setUint32(42, localHeaderOffset, true);
+    centralHeader.set(nameBytes, 46);
+    centralParts.push(centralHeader);
+  }
+  const centralDirOffset = offset;
+  let centralSize = 0;
+  centralParts.forEach(p=> centralSize += p.length);
+
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);     // End of central directory signature
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, centralDirOffset, true);
+  ev.setUint16(20, 0, true);             // comment length
+
+  const totalSize = offset + centralSize + eocd.length;
+  const out = new Uint8Array(totalSize);
+  let p = 0;
+  for(const part of localParts){ out.set(part, p); p += part.length; }
+  for(const part of centralParts){ out.set(part, p); p += part.length; }
+  out.set(eocd, p);
+  return out;
+}
+function __xlsxEscapeXml(v){
+  return String(v==null?'':v).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
+}
+function __xlsxColLetter(n){
+  let s=''; n=n+1;
+  while(n>0){ const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26); }
+  return s;
+}
+function downloadXlsx(filename, headerRow, dataRows){
+  const encoder = new TextEncoder();
+  const allRows = [headerRow, ...dataRows];
+  const rowsXml = allRows.map((row,ri)=>{
+    const r = ri+1;
+    const cellsXml = row.map((val,ci)=>{
+      const ref = __xlsxColLetter(ci)+r;
+      if(typeof val === 'number' && isFinite(val)){
+        return `<c r="${ref}"><v>${val}</v></c>`;
+      }
+      return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${__xlsxEscapeXml(val)}</t></is></c>`;
+    }).join('');
+    return `<row r="${r}">${cellsXml}</row>`;
+  }).join('');
+
+  const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`;
+  const rootRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`;
+  const workbookXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`;
+  const workbookRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`;
+  const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rowsXml}</sheetData></worksheet>`;
+
+  const entries = [
+    {name:'[Content_Types].xml', data: encoder.encode(contentTypesXml)},
+    {name:'_rels/.rels', data: encoder.encode(rootRelsXml)},
+    {name:'xl/workbook.xml', data: encoder.encode(workbookXml)},
+    {name:'xl/_rels/workbook.xml.rels', data: encoder.encode(workbookRelsXml)},
+    {name:'xl/worksheets/sheet1.xml', data: encoder.encode(sheetXml)},
+  ];
+  const zipBytes = buildZipStored(entries);
+  const blob = new Blob([zipBytes], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click();
+  a.remove(); setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
 function toast(msg, isErr){
   const t=document.getElementById('toast');
   t.textContent=msg; t.classList.toggle('err', !!isErr);
@@ -1639,6 +1814,17 @@ async function renderStudentDashboard(){
   const myRegs = (await dbGetAllByIndex('registrations','studentId', currentUser.id)).filter(r=>r.status==='registered');
   const hour = new Date().getHours();
   const greeting = hour<12?'صباح الخير':(hour<18?'مساء الخير':'مساء الخير');
+
+  // موادي المسجلة عبر كل الفصول (وليس فقط المعتمدة حاليًا) — نفس نمط بيانات renderMyHistory
+  const allMyRegs = (await dbGetAllByIndex('registrations','studentId', currentUser.id)).filter(r=>r.status==='registered'||r.status==='pending'||r.status==='waitlisted');
+  const allSemesters = await dbGetAll('semesters'); const allCourses = await dbGetAll('courses');
+  const bySemAll = {};
+  allMyRegs.forEach(r=>{ (bySemAll[r.semesterId] = bySemAll[r.semesterId]||[]).push(r); });
+  const semEntriesSorted = Object.entries(bySemAll).sort((a,b)=>{
+    const sa = allSemesters.find(s=>s.id===a[0]), sb = allSemesters.find(s=>s.id===b[0]);
+    return new Date((sb&&sb.createdAt)||0) - new Date((sa&&sa.createdAt)||0);
+  });
+
   document.getElementById('viewport').innerHTML = `
     <div class="greet">${greeting}، ${escapeHtml(student.name)} 👋</div>
     <div class="stat-grid">
@@ -1655,6 +1841,25 @@ async function renderStudentDashboard(){
         <div><div class="muted">الدفعة</div><div><b>${escapeHtml(student.batch||'—')}</b></div></div>
         <div><div class="muted">الفصل الدراسي الحالي</div><div><b>${semesterLabel(student.currentLevel||1)} (${yearLabel(student.currentLevel||1)})</b></div></div>
       </div>
+    </div>
+    <div class="card">
+      <h2>📚 موادي المسجلة <button class="btn btn-outline btn-sm" onclick="navigate('myhistory')">عرض التفاصيل الكاملة</button></h2>
+      ${semEntriesSorted.length? semEntriesSorted.map(([semId, rows])=>{
+        const sem = allSemesters.find(s=>s.id===semId);
+        const totalHours = rows.filter(r=>r.status!=='waitlisted').reduce((s,r)=>s+r.creditHours,0);
+        return `<div style="margin-bottom:14px;">
+          <h3 style="font-size:13.5px;">${escapeHtml(sem?sem.name:'—')} <span class="muted">(${totalHours} ساعة)</span></h3>
+          <div class="table-wrap"><table>
+            <thead><tr><th>المقرر</th><th>الساعات</th><th>الحالة</th></tr></thead>
+            <tbody>${rows.map(r=>{
+              const c = allCourses.find(x=>x.id===r.courseId);
+              const pill = r.status==='registered'?'pill-good':(r.status==='waitlisted'?'pill-mid':'pill-gold');
+              const label = r.status==='registered'?'معتمد':(r.status==='waitlisted'?'قائمة انتظار':'قيد المراجعة');
+              return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${r.creditHours}</td><td><span class="pill ${pill}">${label}</span></td></tr>`;
+            }).join('')}</tbody>
+          </table></div>
+        </div>`;
+      }).join('') : '<div class="muted">لا يوجد تسجيل مقررات بعد.</div>'}
     </div>
     ${semesters.length? `<div class="card">
       <h2>⏭️ الفصل الدراسي القادم</h2>
@@ -3373,11 +3578,11 @@ async function renderSettings(){
     <div class="card">
       <h2>تصدير متوافق مع نظام السجل الأكاديمي الإلكتروني</h2>
       <p class="muted" style="line-height:1.9;">
-        يصدّر هذا الخيار سجلات الطلاب بصيغة CSV تحتوي الأعمدة التالية:
-        رقم_جامعي، رقم_التسجيل، اسم_الطالب، الكلية، الدفعة، الفصل_الدراسي، السنة_الدراسية —
-        بحيث يمكن للمسؤول استيرادها يدويًا في نظام السجل الأكاديمي الإلكتروني لإكمال دورة حياة الطالب من التسجيل حتى رصد الدرجات والتخرج.
+        يصدّر هذا الخيار سجلات الطلاب بصيغة ملف Excel (.xlsx) حقيقي يحتوي الأعمدة التالية:
+        رقم_جامعي، رقم_التسجيل، اسم_الطالب، الكلية، الدفعة، التخصص، الفصل_الدراسي_السابق، الفصل_الدراسي_الحالي، السنة_الدراسية —
+        بحيث يمكن للمسؤول فتحها مباشرة في Excel أو استيرادها في نظام السجل الأكاديمي الإلكتروني لإكمال دورة حياة الطالب من التسجيل حتى رصد الدرجات والتخرج.
       </p>
-      <button class="btn btn-gold" onclick="exportAcademicRecordCompatible()">تنزيل بيانات الطلاب (متوافقة)</button>
+      <button class="btn btn-gold" onclick="exportAcademicRecordCompatible()">تنزيل بيانات الطلاب (Excel)</button>
     </div>
   `;
 }
@@ -3404,15 +3609,16 @@ async function importFullBackup(file){
 async function exportAcademicRecordCompatible(){
   const scope = myCollegeScope();
   const students = (await dbGetAll('students')).filter(s=>!s.deleted && (!scope||s.college===scope));
-  let csv = [csvField('رقم_جامعي'), csvField('رقم_التسجيل'), csvField('اسم_الطالب'), csvField('الكلية'), csvField('الدفعة'), csvField('الفصل_الدراسي'), csvField('السنة_الدراسية')].join(',') + '\n';
-  students.forEach(s=>{
-    csv += [
-      csvField(s.id), csvField(s.regNo||''), csvField(s.name), csvField(collegeLabel(s.college)),
-      csvField(s.batch||''), csvField(semesterLabel(s.currentLevel||1)), csvField(yearLabel(s.currentLevel||1)),
-    ].join(',') + '\n';
+  const headerRow = ['رقم_جامعي','رقم_التسجيل','اسم_الطالب','الكلية','الدفعة','التخصص','الفصل_الدراسي_السابق','الفصل_الدراسي_الحالي','السنة_الدراسية'];
+  const dataRows = students.map(s=>{
+    const level = s.currentLevel||1;
+    return [
+      s.id, s.regNo||'', s.name, collegeLabel(s.college), s.batch||'', s.specialization||s.department||'',
+      level>1 ? semesterLabel(level-1) : '—', semesterLabel(level), yearLabel(level),
+    ];
   });
-  downloadFile(`بيانات_طلاب_متوافقة_مع_السجل_الأكاديمي_${todayISO()}.csv`, '﻿'+csv, 'text/csv;charset=utf-8');
-  await addLog('تصدير بيانات طلاب متوافقة مع السجل الأكاديمي', `${students.length} سجل`);
+  downloadXlsx(`بيانات_طلاب_متوافقة_مع_السجل_الأكاديمي_${todayISO()}.xlsx`, headerRow, dataRows);
+  await addLog('تصدير بيانات طلاب متوافقة مع السجل الأكاديمي (Excel)', `${students.length} سجل`);
   toast('تم التنزيل');
 }
 
@@ -3752,25 +3958,48 @@ async function printRegistrationSlip(semId){
   const regs = (await dbGetAllByIndex('registrations','studentId', currentUser.id)).filter(r=>r.status==='registered' && r.semesterId===semId);
   const courses = await dbGetAll('courses'); const offerings = await dbGetAll('offerings');
   const totalHours = regs.reduce((s,r)=>s+r.creditHours,0);
+  const level = student.currentLevel||1;
+  const issuedAt = new Date().toISOString();
+  const serial = docSerialCode('ZU', [student.id, semId, issuedAt]);
+  const watermarkText = 'جامعة زالنجي — نسخة رسمية';
   document.getElementById('printArea').innerHTML = `
-    <div style="font-family:'Segoe UI',Tahoma,Arial,sans-serif;direction:rtl;">
-      <h2 style="color:#0B5D3B;text-align:center;">جامعة زالنجي — إشعار تسجيل فصلي</h2>
-      <p><b>الاسم:</b> ${escapeHtml(student.name)} &nbsp; <b>الرقم الجامعي:</b> ${escapeHtml(student.id)} &nbsp; <b>رقم التسجيل:</b> ${escapeHtml(student.regNo||'')}</p>
-      <p><b>الكلية:</b> ${escapeHtml(collegeLabel(student.college))} &nbsp; <b>الفصل الدراسي:</b> ${escapeHtml(sem.name)}</p>
-      <table style="width:100%;border-collapse:collapse;margin-top:10px;">
-        <thead><tr style="background:#EEF3EC;">
-          <th style="border:1px solid #ccc;padding:6px;">الرمز</th><th style="border:1px solid #ccc;padding:6px;">المقرر</th>
-          <th style="border:1px solid #ccc;padding:6px;">الساعات</th><th style="border:1px solid #ccc;padding:6px;">الأستاذ</th>
+    <div class="slip-doc">
+      <div class="slip-watermark">${Array.from({length:24}).map(()=>`<span>${escapeHtml(watermarkText)}</span>`).join('')}</div>
+      <div class="slip-head">
+        <img src="${UNIV_LOGO_DATA_URI}" alt="شعار الجامعة">
+        <div class="titles">
+          <h2>جامعة زالنجي — إشعار تسجيل فصلي رسمي</h2>
+          <div class="sub">نظام تسجيل الطلاب الإلكتروني — وثيقة صادرة إلكترونيًا</div>
+        </div>
+        <div class="slip-serial">رمز التحقق<br><b>${escapeHtml(serial)}</b></div>
+      </div>
+      <div class="slip-id-block">
+        <div><b>اسم الطالب:</b> ${escapeHtml(student.name)}</div>
+        <div><b>الرقم الجامعي:</b> ${escapeHtml(student.id)}</div>
+        <div><b>رقم التسجيل:</b> ${escapeHtml(student.regNo||'—')}</div>
+        <div><b>الكلية:</b> ${escapeHtml(collegeLabel(student.college))}</div>
+        <div><b>التخصص:</b> ${escapeHtml(student.specialization||student.department||'—')}</div>
+        <div><b>الدفعة:</b> ${escapeHtml(student.batch||'—')}</div>
+        <div><b>الفصل الدراسي السابق:</b> ${level>1? escapeHtml(semesterLabel(level-1)) : '—'}</div>
+        <div><b>الفصل الدراسي الحالي:</b> ${escapeHtml(semesterLabel(level))}</div>
+      </div>
+      <div class="muted" style="margin-bottom:6px;font-size:12px;">الفصل الدراسي المسجَّل به هذا الإشعار: <b>${escapeHtml(sem.name)}</b></div>
+      <table class="slip-table">
+        <thead><tr>
+          <th>الرمز</th><th>المقرر</th><th>الساعات</th><th>الأستاذ</th>
         </tr></thead>
         <tbody>${regs.map(r=>{ const c=courses.find(x=>x.id===r.courseId); const o=offerings.find(x=>x.id===r.offeringId); return `<tr>
-          <td style="border:1px solid #ccc;padding:6px;">${escapeHtml(c?c.code:'')}</td>
-          <td style="border:1px solid #ccc;padding:6px;">${escapeHtml(c?c.name:'')}</td>
-          <td style="border:1px solid #ccc;padding:6px;">${r.creditHours}</td>
-          <td style="border:1px solid #ccc;padding:6px;">${escapeHtml(o?o.instructor||'—':'—')}</td>
-        </tr>`; }).join('')}</tbody>
+          <td>${escapeHtml(c?c.code:'')}</td>
+          <td>${escapeHtml(c?c.name:'')}</td>
+          <td>${r.creditHours}</td>
+          <td>${escapeHtml(o?o.instructor||'—':'—')}</td>
+        </tr>`; }).join('') || `<tr><td colspan="4" style="text-align:center;">لا توجد مقررات معتمدة لهذا الفصل</td></tr>`}</tbody>
       </table>
       <p style="margin-top:10px;"><b>إجمالي الساعات المعتمدة: ${totalHours}</b></p>
-      <p style="margin-top:30px;font-size:12px;color:#555;">تاريخ الطباعة: ${fmtDateTime(new Date().toISOString())}</p>
+      <div class="slip-foot">
+        <span>تاريخ ووقت الإصدار: ${fmtDateTime(issuedAt)}</span>
+        <span>وثيقة صادرة إلكترونيًا من نظام تسجيل الطلاب — جامعة زالنجي — رمز التحقق: ${escapeHtml(serial)}</span>
+      </div>
     </div>
   `;
   window.print();
