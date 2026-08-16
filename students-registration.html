@@ -35,7 +35,8 @@
     box-shadow:var(--shadow);padding:30px 26px;border-top:4px solid var(--gold);
   }
   .auth-seal{width:78px;height:78px;border-radius:50%;border:2px solid var(--gold);margin:0 auto 14px;
-    display:flex;align-items:center;justify-content:center;color:var(--navy);font-weight:900;font-size:26px;background:var(--paper-2);}
+    display:flex;align-items:center;justify-content:center;color:var(--navy);font-weight:900;font-size:26px;background:var(--paper-2);overflow:hidden;}
+  .auth-seal img{width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .auth-card h1{text-align:center;font-size:20px;color:var(--navy);margin:0 0 4px;}
   .auth-card p.sub{text-align:center;color:var(--ink-soft);font-size:13px;margin:0 0 20px;line-height:1.7;}
   .field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px;}
@@ -87,12 +88,34 @@
   }
   .brand{display:flex;align-items:center;gap:10px;}
   .brand .badge{width:46px;height:46px;border-radius:50%;border:2px solid var(--gold);display:flex;
-    align-items:center;justify-content:center;font-size:16px;font-weight:900;color:var(--gold-light);flex-shrink:0;}
+    align-items:center;justify-content:center;font-size:16px;font-weight:900;color:var(--gold-light);flex-shrink:0;overflow:hidden;}
+  .brand .badge img{width:100%;height:100%;object-fit:cover;border-radius:50%;}
   .brand b{font-size:15.5px;display:block;}
   .brand span.tagline{font-size:11px;opacity:.85;}
   .who{display:flex;align-items:center;gap:12px;font-size:13px;flex-wrap:wrap;}
   .who .role-pill{background:rgba(184,145,47,.22);border:1px solid var(--gold);color:var(--gold-light);
     padding:3px 10px;border-radius:20px;font-size:11.5px;white-space:nowrap;}
+
+  .topbar-tools{display:flex;align-items:center;gap:8px;}
+  .search-trigger{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);
+    color:#fff;border-radius:20px;padding:7px 14px;font-family:inherit;font-size:12.5px;cursor:pointer;min-height:36px;}
+  .search-trigger:hover{background:rgba(255,255,255,.2);}
+  .bell-btn{position:relative;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;
+    border-radius:50%;width:36px;height:36px;min-height:36px;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+  .bell-btn:hover{background:rgba(255,255,255,.2);}
+  .bell-dot{position:absolute;top:-3px;left:-3px;background:var(--warn);color:#fff;font-size:9.5px;font-weight:800;
+    min-width:16px;height:16px;border-radius:10px;display:flex;align-items:center;justify-content:center;padding:0 3px;border:1.5px solid var(--navy);}
+  .notif-panel{position:fixed;top:64px;left:16px;width:320px;max-width:92vw;max-height:70vh;overflow-y:auto;background:#fff;
+    border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.3);z-index:150;display:none;}
+  .notif-panel.show{display:block;}
+  .notif-panel .np-head{padding:12px 14px;border-bottom:1px solid var(--line);font-weight:800;color:var(--navy);font-size:13.5px;}
+  .notif-item{padding:10px 14px;border-bottom:1px solid var(--line);cursor:pointer;font-size:12.5px;line-height:1.7;}
+  .notif-item:hover{background:var(--paper-2);}
+  .notif-item .ni-t{color:var(--ink-soft);font-size:11px;}
+  .search-modal-input{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:8px;font-size:15px;margin-bottom:14px;}
+  .search-group-title{font-size:11.5px;color:var(--gold);font-weight:800;letter-spacing:.5px;margin:14px 0 6px;text-transform:uppercase;}
+  .search-result-item{padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13.5px;display:flex;justify-content:space-between;gap:8px;align-items:center;}
+  .search-result-item:hover{background:var(--paper-2);}
 
   nav.tabs{
     background:#fff;border-bottom:1px solid var(--line);display:flex;gap:4px;padding:0 14px;
@@ -189,6 +212,7 @@
     header.topbar{padding:10px 12px;}
     main#viewport{padding:16px 10px 50px;}
     .card{padding:16px;}
+    .search-trigger span.st-label{display:none;}
   }
 </style>
 </head>
@@ -203,11 +227,15 @@
 <div id="shell">
   <header class="topbar">
     <div class="brand">
-      <div class="badge">جز</div>
+      <div class="badge" id="brandBadge"></div>
       <div>
         <b>جامعة زالنجي</b>
         <span class="tagline">نظام تسجيل الطلاب الإلكتروني</span>
       </div>
+    </div>
+    <div class="topbar-tools">
+      <button class="search-trigger" onclick="openSearchModal()"><span>🔍</span><span class="st-label">بحث... (Ctrl+K)</span></button>
+      <button class="bell-btn" id="bellBtn" onclick="toggleNotifPanel(event)">🔔<span class="bell-dot" id="bellDot" style="display:none;">0</span></button>
     </div>
     <div class="who">
       <span id="whoName"></span>
@@ -218,6 +246,8 @@
   <nav class="tabs" id="tabsNav"></nav>
   <main id="viewport"></main>
 </div>
+
+<div class="notif-panel" id="notifPanel"></div>
 
 <!-- ============== نافذة منبثقة عامة ============== -->
 <div class="modal-overlay" id="modalOverlay">
@@ -284,6 +314,15 @@ function collegeOptionsHtml(selected, withEmpty){
     COLLEGES.map(c=>`<option value="${c.key}" ${selected===c.key?'selected':''}>${c.label}</option>`).join('');
 }
 
+/* ==================== أسماء الفصول الدراسية والسنوات الأكاديمية بالعربية ==================== */
+const SEMESTER_ORDINALS = ['الأول','الثاني','الثالث','الرابع','الخامس','السادس','السابع','الثامن','التاسع','العاشر','الحادي عشر','الثاني عشر','الثالث عشر','الرابع عشر'];
+function semesterOrdinalWord(n){ n=parseInt(n,10)||1; return SEMESTER_ORDINALS[n-1] || ('رقم '+n); }
+function semesterLabel(n){ return 'الفصل الدراسي '+semesterOrdinalWord(n); }
+const YEAR_ORDINALS = ['الأولى','الثانية','الثالثة','الرابعة','الخامسة','السادسة','السابعة','الثامنة'];
+function academicYearNumber(n){ n=parseInt(n,10)||1; return Math.ceil(n/2); }
+function yearOrdinalWord(n){ n=parseInt(n,10)||1; return YEAR_ORDINALS[n-1] || ('رقم '+n); }
+function yearLabel(n){ return 'السنة '+yearOrdinalWord(academicYearNumber(n)); }
+
 const ROLES = {
   admin:     {label:'مسؤول النظام',        canManageUsers:true,  canViewLogs:true,  canManageCatalog:true, canManageAdmissions:true, canManageStudents:true, canManageSemesters:true, canReviewFinance:true, canBackup:true},
   registrar: {label:'مسؤول قبول وتسجيل',   canManageUsers:false, canViewLogs:false, canManageCatalog:true, canManageAdmissions:true, canManageStudents:true, canManageSemesters:true, canReviewFinance:true, canBackup:true},
@@ -313,6 +352,9 @@ const EXTERNAL_LINKS = [
   {label:'فيسبوك', icon:'📘', url:'https://www.facebook.com/zalingei.university'},
 ];
 
+/* ==================== شعار الجامعة (مضمَّن كصورة base64 — ملف واحد ذاتي الاكتفاء) ==================== */
+const UNIV_LOGO_DATA_URI = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAACgCAYAAACLz2ctAABOKUlEQVR42u2dd5hdVdn2f2utXU6dljbpBVIhEEJvCS1UpUhRqSIIgoBIEfxemiK+KiiiUlVERFooIoTyUkMNJYS0SSM9kzr99L33Wuv748wMAQMCFgY593VxhTkzZ5991r7X059nQQUVVFBBBRVUUEEFFVRQQQUVVFBBBRVUUEEFFVRQQQUVVFBBBRVUUEEFFVRQQQUVVFBBBRX8ExA94R4mT56sKo/iP4e+ffvaqVOn6spKVFCRgJ/xZ9vDDjus1nXdY6y1Nooi4ziOFEIIrbWx1hoAY4wVQtjN/wVs94WEsFv6AGutkFKKj/v9pZQYYxBCiK7rbn4PH/VZm//OGGOVUmhdFjJKKYwxVkopNn8tiiKh1HvCv+t3/+hzur7bB+5dWGtF5+tiC/dmhBBWCCE9z8sffPDBj5155pnhF5aAxx57rJo6daoeMGDA7nfeeeerY8aMQWuNlPIfvtda+2EEeN/fbP5zT0bXvW7+vT7s3j/qu3/Y77p+r7XGcRyefPLJ/IUXXjgwk8m0GWPE5pv5Pw3ns158rbUZNGiQHjhwoPmYG+LzwaoeynVADBs2rK29vd1+nM3+X09AwJZKJWWMkcYY0RMW5b8VURRZx3FEqVTqMU5fTyAgQohu1SulfJ/6NMZ0/25zVbX5v1v63ZZUsda6yx5DCPEPr7W5ytvStY0xH7Qdt/h3H6V2u/7fWvu+77m5Gt785w+ux+bqVUr5od+p6++6zNueQsDPXNyEYSg++LA2/7mLkJu//sF/t/Ra10Pt+jkMQ7oM/q4HFQTBR17rw4jadX0pJVJKisXi3z38ze9hc9JZa7uvuzkRP/g9P4Q477ORu143xqCUQghBsVj80LVwXXfz7yAqEhAYPXq0Wbx4MdOmTeOSSy4B4MYbb2THHXekra2Nxx9/nF//+tdYa7n22ms5+eSTefjhh+nfvz9z5szhsssuQ0rJCy+8QENDA0IIXn75ZZLJJIcccgjDhw/nmmuuob6+nlgsxjXXXENDQwPXX389SinOOusstNa89dZbRFHEm2++ST6fp6amhkmTJrFo0SLOO+88BgwYwK9+9SuGDRvGkUceCcCSJUu4/vrrMcagteayyy5j6NChnHnmmd2S6tRTT2W33XZDa821117LihUrSCaTzJ07l9/85jeMHj2au+++m2eeeYbbb78dgN/97ncMGjSIQw45BICHHnqIKIrYfvvtueqqq/jzn/+MUoo77riDrbfemr333pt77rmH5557Diklw4cP55JLLuH8888nk8ngOA5nnnkmixYtok+fPtTW1lYkYBfS6bRob29n1qxZ3a/Nnz+f9evXUygUuP3223nmmWcQQjBz5kxKpRIzZ84kmUwye/Zs5syZA8A999zDgAEDmDNnDt/4xje47bbbOOqoo3j77bepr6/nN7/5DevWrePuu+/muuuu44wzzuD2229n7NixLF++nLlz53L66afz3e9+l46ODn7xi1/w9a9/nWQyyZ/+9CcymQzTpk1j0qRJAJRKJc4991wOPvhgfvvb37LvvvtyxhlnUCwWWbx4MT/96U+59dZb2Wmnnbol13e+8x1++ctfssMOO5BOpxk6dChhGPLcc8/x9ttvM2/ePAAaGhpYvXp193qsXLmSpUuXYozh0Ucf5fe//z1CCObOnUuxWOSpp57i7rvv5vLLL+eWW27hrLPOAmDBggVcffXV3Hbbbey4447MmjWLdevW4XkeFQJuFs9SShGPx7tfi8Vi+L5PGIZcfPHF3HDDDd1SSUqJ67r07duXffbZh+eeew5rLcuXL+ewww7DGMPMmTN5/PHHWbNmDVVVVRQKBd59912SySSjRo1i4sSJ3HLLLSxcuJBUKoUQgng8TiqVok+fPtTU1FBXV0csFuOCCy5g4cKFXHDBBZx//vnU1dUBMGPGDGprazn88MMRQnD88cfj+z6zZs2irq6O1157jVdeeYVisditBtPpNEEQcPvtt/PrX/+aWCzGvHnzGDx4MFdddRWPPPII1lo8z3sfSXzfJ5FI0NHRwXe/+12mTZvGmjVr6N27NwD33nsvV111FUOGDGHTpk14nocQAtd1eeaZZ5g2bRrt7e2k02lc1/3IcM0XjoCdgeVuQ77LUbDW0tHRwfbbb89RRx3Fj370I2pra9FaI4SgUChw8MEHs2DBAl566SWGDBmC67oUi0VWrFhBQ0MDzc3NxGIxFi5cyHXXXUdTUxN77LEH5513Hvvttx+nnXYa06ZNI5VKEUVRt62otcZaSxRFJJNJ9t57726CB0EAQEtLC1VVVd3SEKC6upp8Pk8Yhrzyyiu8+OKLZDKZ9zks5513HieddBIDBw7EWssL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";
+
 /* ==================== أدوات عامة ==================== */
 function uid(){ return (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Date.now()+'-'+Math.random().toString(16).slice(2)); }
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -325,6 +367,10 @@ function downloadFile(filename, content, mime){
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click();
   a.remove(); setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+function csvField(v){
+  const s = (v==null?'':String(v));
+  return '"' + s.replace(/"/g,'""') + '"';
 }
 function toast(msg, isErr){
   const t=document.getElementById('toast');
@@ -1213,6 +1259,14 @@ async function init(){
 }
 window.addEventListener('DOMContentLoaded', init);
 
+/* اختصار لوحة المفاتيح العام: Ctrl/Cmd+K يفتح نافذة البحث الشاملة — يعمل فقط
+   حين يكون هيكل التطبيق ظاهرًا (بعد تسجيل الدخول) */
+document.addEventListener('keydown', function(e){
+  if((e.ctrlKey||e.metaKey) && String(e.key).toLowerCase()==='k'){
+    if(currentUser){ e.preventDefault(); openSearchModal(); }
+  }
+});
+
 async function doLogout(){
   await addLog('تسجيل الخروج');
   if(supabaseClient){
@@ -1230,10 +1284,12 @@ async function doLogout(){
 function enterShell(){
   document.getElementById('authWrap').style.display='none';
   document.getElementById('shell').style.display='flex';
+  document.getElementById('brandBadge').innerHTML = `<img src="${UNIV_LOGO_DATA_URI}" alt="شعار الجامعة">`;
   document.getElementById('whoName').textContent = currentUser.type==='staff' ? (currentUser.fullName||currentUser.username) : currentUser.name;
   document.getElementById('whoRole').textContent = currentUser.type==='staff' ? (ROLES[currentUser.role].label + (myCollegeScope()? ' — '+collegeLabel(myCollegeScope()) : '')) : ('طالب — '+collegeLabel(currentUser.college));
   buildNav();
   navigate('dashboard');
+  refreshNotifBadge();
 }
 
 /* ==================== شاشات المصادقة ==================== */
@@ -1246,7 +1302,7 @@ async function renderAuth(){
     return;
   }
   card.innerHTML = `
-    <div class="auth-seal">جز</div>
+    <div class="auth-seal"><img src="${UNIV_LOGO_DATA_URI}" alt="شعار الجامعة"></div>
     <h1>جامعة زالنجي</h1>
     <p class="sub">نظام تسجيل الطلاب الإلكتروني</p>
     <div class="segmented">
@@ -1267,7 +1323,7 @@ function renderAuthModeBody(){
 
 function renderFirstRunSetup(){
   return `
-    <div class="auth-seal">جز</div>
+    <div class="auth-seal"><img src="${UNIV_LOGO_DATA_URI}" alt="شعار الجامعة"></div>
     <h1>مرحبًا بك</h1>
     <p class="sub">هذه أول تشغيل للنظام على هذا الجهاز. أنشئ حساب مسؤول النظام الأول للمتابعة.</p>
     <div class="field"><label for="fr-user">اسم المستخدم</label><input id="fr-user" placeholder="مثال: admin"></div>
@@ -1421,6 +1477,105 @@ async function render(){
   }
 }
 
+/* ==================== جرس الإشعارات ==================== */
+async function computeNotifItems(){
+  const items = [];
+  if(!currentUser) return items;
+  if(currentUser.type==='staff'){
+    const scope = myCollegeScope();
+    if(perm('canManageAdmissions') || perm('canManageSemesters')){
+      let pending = (await dbGetAll('registrationRequests')).filter(r=>r.status==='pending' && (!scope||r.college===scope));
+      if(pending.length){
+        items.push({label:`${pending.length} طلب تسجيل بانتظار المراجعة المالية`, time:null, action:()=>navigate('registrations',{})});
+      }
+    }
+    if(perm('canViewLogs')){
+      const logs = (await dbGetAll('logs')).sort((a,b)=> new Date(b.ts)-new Date(a.ts)).slice(0,8);
+      logs.forEach(l=> items.push({label:`${l.action}${l.details?' — '+l.details:''}`, time:fmtDateTime(l.ts), action:()=>navigate('logs')}));
+    }
+  } else {
+    const student = await dbGet('students', currentUser.id);
+    if(student){
+      activeFlags(student).forEach(f=>{
+        const t = FLAG_TYPES[f.type] || {label:f.type};
+        items.push({label:`عائق فعّال على تسجيلك: ${t.label}`, time:fmtDateTime(f.setAt), action:()=>navigate('myprofile')});
+      });
+    }
+    const openSemesters = (await dbGetAll('semesters')).filter(s=>s.regOpen);
+    openSemesters.forEach(s=> items.push({label:`فصل دراسي مفتوح للتسجيل: ${s.name}`, time:null, action:()=>navigate('myregistration',{semId:s.id})}));
+    const myRequests = (await dbGetAllByIndex('registrationRequests','studentId', currentUser.id)).sort((a,b)=> new Date(b.submittedAt)-new Date(a.submittedAt)).slice(0,5);
+    myRequests.forEach(r=> items.push({label:`حالة طلب تسجيلك: ${r.status==='approved'?'معتمد':(r.status==='rejected'?'مرفوض':'قيد المراجعة')}`, time:fmtDateTime(r.submittedAt), action:()=>navigate('myregistration',{semId:r.semesterId})}));
+  }
+  return items;
+}
+async function refreshNotifBadge(){
+  try{
+    const items = await computeNotifItems();
+    const dot = document.getElementById('bellDot');
+    if(!dot) return;
+    if(items.length){ dot.style.display='flex'; dot.textContent = items.length>99?'99+':String(items.length); }
+    else{ dot.style.display='none'; }
+  }catch(e){ /* تجاهل */ }
+}
+let __notifItemsCache = [];
+async function toggleNotifPanel(e){
+  if(e) e.stopPropagation();
+  const panel = document.getElementById('notifPanel');
+  if(panel.classList.contains('show')){ panel.classList.remove('show'); return; }
+  const items = await computeNotifItems();
+  __notifItemsCache = items;
+  panel.innerHTML = `<div class="np-head">🔔 الإشعارات</div>` + (items.length? items.map((it,i)=>
+    `<div class="notif-item" onclick="__notifItemsCache[${i}].action(); document.getElementById('notifPanel').classList.remove('show');">
+      <div>${escapeHtml(it.label)}</div>${it.time? `<div class="ni-t">${escapeHtml(it.time)}</div>`:''}
+    </div>`).join('') : `<div class="notif-item" style="cursor:default;">لا توجد إشعارات جديدة</div>`);
+  panel.classList.add('show');
+}
+document.addEventListener('click', function(e){
+  const panel = document.getElementById('notifPanel');
+  const bell = document.getElementById('bellBtn');
+  if(panel && panel.classList.contains('show') && !panel.contains(e.target) && e.target!==bell){ panel.classList.remove('show'); }
+});
+
+/* ==================== نافذة البحث الشامل (Ctrl+K) ==================== */
+function openSearchModal(){
+  openModal('بحث شامل', `
+    <input type="text" id="globalSearchInput" class="search-modal-input" placeholder="ابحث عن طالب، مقرر، قسم..." oninput="runGlobalSearch(this.value)" autocomplete="off">
+    <div id="globalSearchResults"><div class="muted">اكتب حرفين على الأقل لبدء البحث.</div></div>
+  `, `<button class="btn btn-outline" onclick="closeModal()">إغلاق</button>`);
+  setTimeout(()=>{ const el=document.getElementById('globalSearchInput'); if(el) el.focus(); }, 50);
+}
+async function runGlobalSearch(qRaw){
+  const q = String(qRaw||'').trim().toLowerCase();
+  const box = document.getElementById('globalSearchResults');
+  if(!box) return;
+  if(q.length<2){ box.innerHTML = '<div class="muted">اكتب حرفين على الأقل لبدء البحث.</div>'; return; }
+  const groups = [];
+  if(currentUser.type==='staff'){
+    const scope = myCollegeScope();
+    let students = (await dbGetAll('students')).filter(s=>!s.deleted && (!scope||s.college===scope));
+    students = students.filter(s=> s.name.toLowerCase().includes(q) || s.id.toLowerCase().includes(q) || (s.regNo||'').toLowerCase().includes(q)).slice(0,8);
+    if(students.length) groups.push({title:'طلاب', items: students.map(s=>({label:`${s.name} — ${s.id}`, action:()=>navigate('studentDetail',{id:s.id})}))});
+
+    let courses = (await dbGetAll('courses')).filter(c=>!scope||c.college===scope);
+    courses = courses.filter(c=> c.code.toLowerCase().includes(q) || c.name.toLowerCase().includes(q)).slice(0,8);
+    if(courses.length) groups.push({title:'مقررات', items: courses.map(c=>({label:`${c.code} — ${c.name}`, action:()=>navigate('courses')}))});
+
+    let depts = (await dbGetAll('departments')).filter(d=>!scope||d.college===scope);
+    depts = depts.filter(d=> d.name.toLowerCase().includes(q) || d.code.toLowerCase().includes(q)).slice(0,8);
+    if(depts.length) groups.push({title:'أقسام', items: depts.map(d=>({label:`${d.code} — ${d.name}`, action:()=>navigate('departments')}))});
+  } else {
+    const student = await dbGet('students', currentUser.id);
+    if(student && (student.name.toLowerCase().includes(q) || student.id.toLowerCase().includes(q) || (student.regNo||'').toLowerCase().includes(q))){
+      groups.push({title:'بياناتي', items:[{label:`${student.name} — ${student.id}`, action:()=>navigate('myprofile')}]});
+    }
+  }
+  window.__searchResultGroups = groups;
+  if(!groups.length){ box.innerHTML = '<div class="muted">لا توجد نتائج مطابقة.</div>'; return; }
+  box.innerHTML = groups.map((g,gi)=> `<div class="search-group-title">${escapeHtml(g.title)}</div>` +
+    g.items.map((it,ii)=> `<div class="search-result-item" onclick="window.__searchResultGroups[${gi}].items[${ii}].action(); closeModal();"><span>${escapeHtml(it.label)}</span></div>`).join('')
+  ).join('');
+}
+
 /* ==================== لوحة الرئيسية ==================== */
 async function renderDashboard(){
   if(currentUser.type==='student'){ return renderStudentDashboard(); }
@@ -1432,6 +1587,10 @@ async function renderDashboard(){
   const openSemesters = semesters.filter(s=>s.regOpen).length;
   const hour = new Date().getHours();
   const greeting = hour<12?'صباح الخير':(hour<18?'مساء الخير':'مساء الخير');
+  const byCollege = {};
+  students.forEach(s=>{ byCollege[s.college] = (byCollege[s.college]||0)+1; });
+  const topColleges = Object.entries(byCollege).sort((a,b)=>b[1]-a[1]).slice(0,4);
+  const maxCollegeCount = Math.max(1, ...topColleges.map(x=>x[1]));
   document.getElementById('viewport').innerHTML = `
     <div class="greet">${greeting}، ${escapeHtml(currentUser.fullName||currentUser.username)} 👋 — ${escapeHtml(ROLES[currentUser.role].label)}</div>
     <div class="stat-grid">
@@ -1449,11 +1608,27 @@ async function renderDashboard(){
             <span class="pill pill-navy">${escapeHtml(s.regNo||'—')}</span>
           </div>`).join('') || '<div class="muted">لا يوجد طلاب بعد.</div>'}
       </div>
-      <div class="card">
+      ${!scope? `<div class="card">
+        <h2>🏫 أعلى الكليات عددًا للطلاب</h2>
+        ${topColleges.map(([k,n])=>`
+          <div style="margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>${escapeHtml(collegeLabel(k))}</span><span>${n}</span></div>
+            <div class="bar-outer"><div class="bar-inner" style="width:${(n/maxCollegeCount)*100}%"></div></div>
+          </div>`).join('') || '<div class="muted">لا توجد بيانات بعد.</div>'}
+      </div>` : `<div class="card">
         <h2>🔗 روابط الجامعة</h2>
         ${EXTERNAL_LINKS.map(l=>`<a href="${l.url}" target="_blank" rel="noopener" style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);text-decoration:none;color:var(--ink);"><span>${l.icon}</span><span>${escapeHtml(l.label)}</span></a>`).join('')}
-        <div class="hint-box">هذا النظام متوافق مع نظام السجل الأكاديمي الإلكتروني لجامعة زالنجي (نفس الكليات وهوية التصميم)، مع إمكانية تصدير بيانات الطلاب بصيغة متوافقة لدمجها لاحقًا (تبويب «الإعدادات»).</div>
+      </div>`}
+    </div>
+    <div class="card">
+      <h2>🚀 اختصارات سريعة</h2>
+      <div class="row">
+        ${perm('canManageAdmissions')? `<button class="btn btn-gold" onclick="navigate('admissions')">📋 كشف قبول جديد</button>`:''}
+        ${perm('canManageAdmissions')? `<button class="btn btn-outline" onclick="navigate('students')">🎓 تسجيل طالب</button>`:''}
+        ${perm('canManageSemesters')? `<button class="btn btn-outline" onclick="navigate('semesters')">📅 فتح فصل جديد</button>`:''}
+        <button class="btn btn-outline" onclick="navigate('reports')">📊 عرض التقارير</button>
       </div>
+      <div class="hint-box">هذا النظام متوافق مع نظام السجل الأكاديمي الإلكتروني لجامعة زالنجي (نفس الكليات وهوية التصميم)، مع إمكانية تصدير بيانات الطلاب بصيغة متوافقة لدمجها لاحقًا (تبويب «الإعدادات»).</div>
     </div>
   `;
 }
@@ -1478,9 +1653,14 @@ async function renderStudentDashboard(){
         <div><div class="muted">الكلية</div><div><b>${escapeHtml(collegeLabel(student.college))}</b></div></div>
         <div><div class="muted">القسم/التخصص</div><div><b>${escapeHtml(student.department||'—')}</b></div></div>
         <div><div class="muted">الدفعة</div><div><b>${escapeHtml(student.batch||'—')}</b></div></div>
-        <div><div class="muted">المدرسة الثانوية</div><div><b>${escapeHtml(student.secondarySchool||'—')}</b></div></div>
+        <div><div class="muted">الفصل الدراسي الحالي</div><div><b>${semesterLabel(student.currentLevel||1)} (${yearLabel(student.currentLevel||1)})</b></div></div>
       </div>
     </div>
+    ${semesters.length? `<div class="card">
+      <h2>⏭️ الفصل الدراسي القادم</h2>
+      <div class="hint-box good-box">يوجد ${semesters.length} فصل دراسي مفتوح للتسجيل الآن — يمكنك التقدّم للتسجيل مباشرة.</div>
+      <div class="row"><button class="btn btn-gold" onclick="navigate('myregistration')">تسجيل الفصل القادم</button></div>
+    </div>` : ''}
     <div class="card">
       <h2>🚀 اختصارات</h2>
       <div class="row">
@@ -1818,6 +1998,11 @@ async function createExistingStudentRecord(data){
   await setStudentPassword(studentId, tempPw);
   return {row, tempPw};
 }
+function downloadExistingStudentsTemplate(){
+  let csv = 'الرقم الجامعي/الاستمارة,رقم التسجيل,الاسم,الفصل الدراسي الحالي,التخصص,الدفعة,النتيجة\n';
+  csv += '442100123,2-ن-22,أحمد محمد علي,3,علوم الحاسوب,2022,ناجح\n';
+  downloadFile('نموذج_استيراد_طلاب_حاليين.csv', '﻿'+csv, 'text/csv;charset=utf-8');
+}
 async function openBulkExistingStudentsModal(){
   const scope = myCollegeScope();
   const college = scope || lastAdmissionCollege || COLLEGES[0].key;
@@ -1825,6 +2010,7 @@ async function openBulkExistingStudentsModal(){
   const year = lastAdmissionYear || new Date().getFullYear();
   openModal('إضافة مجموعة طلاب (طلاب حاليون)', `
     <p class="muted" style="line-height:1.9;">لطلاب موجودين فعلاً (ليسوا جددًا) — رقم التسجيل والفصل الدراسي الحالي يُؤخذان كما وردا في الملف ولا يُولَّدان تلقائيًا. الأعمدة المطلوبة: «الرقم الجامعي/الاستمارة»، «رقم التسجيل»، «الاسم»، «الفصل الدراسي الحالي». الأعمدة الاختيارية: «التخصص»، «الدفعة»، «النتيجة» (ناجح/ملحق/راسب — تُستخدم فقط إن لم يوجد للطالب سجل تسجيل سابق داخل النظام، وتُطابَق حصرًا بنفس الفصل الحالي المُدخَل).</p>
+    <button class="btn btn-outline btn-sm" onclick="downloadExistingStudentsTemplate()">⬇️ تنزيل نموذج الملف</button>
     ${!scope? `<div class="field"><label for="ex-college">الكلية</label><select id="ex-college" onchange="refreshExistingDeptOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
     <div class="field"><label for="ex-dept">القسم/التخصص</label><select id="ex-dept">${depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>'}</select></div>
     <div class="field"><label for="ex-file">ملف الطلاب (Excel أو CSV)</label><input type="file" id="ex-file" accept=".xlsx,.xls,.csv"></div>
@@ -1926,7 +2112,7 @@ async function renderStudents(){
         ${!scope? `<div class="field"><label>الكلية</label><select id="filterCollege" onchange="studentsFilterNav({dept:''})"><option value="">— كل الكليات —</option>${COLLEGES.map(c=>`<option value="${c.key}" ${collegeFilter===c.key?'selected':''}>${c.label}</option>`).join('')}</select></div>`:''}
         <div class="field"><label>القسم</label><select id="filterDept" onchange="studentsFilterNav()"><option value="">— كل الأقسام —</option>${deptOptionsForFilter.map(d=>`<option value="${d.id}" ${deptFilter===d.id?'selected':''}>${escapeHtml(d.name)}</option>`).join('')}</select></div>
         <div class="field"><label>التخصص</label><input id="filterSpec" value="${escapeHtml(viewParams.spec||'')}" placeholder="نص حر" oninput="studentsFilterNav()"></div>
-        <div class="field"><label>الفصل الدراسي</label><select id="filterLevel" onchange="studentsFilterNav()"><option value="">— كل الفصول —</option>${Array.from({length:12},(_,i)=>i+1).map(n=>`<option value="${n}" ${String(levelFilter)===String(n)?'selected':''}>الفصل ${n}</option>`).join('')}</select></div>
+        <div class="field"><label>الفصل الدراسي</label><select id="filterLevel" onchange="studentsFilterNav()"><option value="">— كل الفصول —</option>${Array.from({length:12},(_,i)=>i+1).map(n=>`<option value="${n}" ${String(levelFilter)===String(n)?'selected':''}>${semesterLabel(n)}</option>`).join('')}</select></div>
       </div>
       <div class="table-wrap">
       <table>
@@ -1939,7 +2125,7 @@ async function renderStudents(){
               <td>${escapeHtml(s.name)}</td>
               <td>${escapeHtml(collegeLabel(s.college))}</td>
               <td>${escapeHtml(s.department||'—')}${s.specialization && s.specialization!==s.department ? ' / '+escapeHtml(s.specialization):''}</td>
-              <td>${escapeHtml(String(s.currentLevel||1))}</td>
+              <td>${escapeHtml(semesterLabel(s.currentLevel||1))} <span class="muted">(${escapeHtml(yearLabel(s.currentLevel||1))})</span></td>
               <td class="fit"><button class="btn btn-outline btn-sm" onclick="navigate('studentDetail',{id:'${s.id}'})">تفاصيل</button></td>
             </tr>`).join('') || `<tr><td colspan="7" class="muted" style="text-align:center;padding:20px;">لا يوجد طلاب مطابقون</td></tr>`}
         </tbody>
@@ -1970,7 +2156,7 @@ async function renderStudentDetail(){
         <div><div class="muted">الكلية</div><div><b>${escapeHtml(collegeLabel(student.college))}</b></div></div>
         <div><div class="muted">القسم/التخصص</div><div><b>${escapeHtml(student.department||'—')}</b></div></div>
         <div><div class="muted">الدفعة (سنة القبول)</div><div><b>${escapeHtml(student.batch||'—')}</b></div></div>
-        <div><div class="muted">الفصل الدراسي الحالي</div><div><b>الفصل الدراسي ${escapeHtml(String(student.currentLevel||1))}</b></div></div>
+        <div><div class="muted">الفصل الدراسي الحالي</div><div><b>${escapeHtml(semesterLabel(student.currentLevel||1))} (${escapeHtml(yearLabel(student.currentLevel||1))})</b></div></div>
         <div><div class="muted">المدرسة الثانوية</div><div>${escapeHtml(student.secondarySchool||'—')}</div></div>
         <div><div class="muted">الهاتف</div><div>${escapeHtml(student.phone||'—')}</div></div>
       </div>
@@ -2224,7 +2410,7 @@ async function renderCourses(){
             <td>${escapeHtml(c.name)}</td>
             <td>${escapeHtml(collegeLabel(c.college))}</td>
             <td>${escapeHtml(String(c.creditHours))}</td>
-            <td>${escapeHtml(String(c.level||'—'))}</td>
+            <td>${c.level? escapeHtml(semesterLabel(c.level)) : '—'}</td>
             <td>${(c.prerequisites||[]).length? (c.prerequisites||[]).map(p=>{const pc=list.find(x=>x.id===p); return escapeHtml(pc?pc.code:p);}).join('، '):'—'}</td>
             <td class="fit">${perm('canManageCatalog')? `<button class="icon-btn" onclick="openAddCourseModal('${c.id}')" title="تعديل">✏️</button><button class="icon-btn" onclick="deleteCourse('${c.id}')" title="حذف">🗑️</button>`:''}</td>
           </tr>`).join('') || `<tr><td colspan="7" class="muted" style="text-align:center;padding:20px;">لا توجد مقررات بعد</td></tr>`}
@@ -2298,10 +2484,16 @@ async function deleteCourse(id){
   await addLog('حذف مقرر', id);
   toast('تم الحذف'); navigate('courses');
 }
+function downloadCoursesTemplate(){
+  let csv = 'رمز المقرر,اسم المقرر,الساعات المعتمدة,الفصل الدراسي,الكلية\n';
+  csv += 'CS101,مقدمة في البرمجة,3,1,كلية علوم الحاسوب وتقانة المعلومات\n';
+  downloadFile('نموذج_استيراد_مقررات.csv', '﻿'+csv, 'text/csv;charset=utf-8');
+}
 function openBulkCoursesModal(){
   const scope = myCollegeScope();
   openModal('استيراد مقررات جماعيًا', `
     <p class="muted" style="line-height:1.9;">أعمدة الملف المطلوبة: «رمز المقرر»، «اسم المقرر». أعمدة اختيارية: «الساعات المعتمدة» (افتراضي 3)، «الفصل الدراسي» (المستوى)${scope?'':'، «الكلية»'}. لا يدعم الاستيراد الجماعي تحديد المتطلبات السابقة — يمكن إضافتها لاحقًا يدويًا من تبويب المقررات.</p>
+    <button class="btn btn-outline btn-sm" onclick="downloadCoursesTemplate()">⬇️ تنزيل نموذج الملف</button>
     <div class="field"><label for="csb-file">ملف المقررات (Excel أو CSV)</label><input type="file" id="csb-file" accept=".xlsx,.xls,.csv"></div>
     <div class="err-text" id="csb-err"></div>
   `, `
@@ -2375,14 +2567,14 @@ async function renderCurricula(){
     ${dept? `
     <div class="card">
       <h2>مستويات «${escapeHtml(dept.name)}» <span class="eyebrow">${allCurricula.length}</span>
-        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ فصل دراسي جديد</button>`:''}
+        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ فصل دراسي جديد</button> <button class="btn btn-outline btn-sm" onclick="openImportCurriculumModal('${deptId}')">📥 استيراد المنهج من ملف</button>`:''}
       </h2>
       ${allCurricula.map(cur=>{
         const list = (cur.courseIds||[]).map(cid=> courses.find(c=>c.id===cid)).filter(Boolean);
         const totalHours = list.reduce((s,c)=>s+(c.creditHours||0),0);
         return `<div class="offering-card">
           <div class="offering-main">
-            <div class="cname">الفصل الدراسي ${escapeHtml(String(cur.level))} <span class="muted">(${list.length} مقررًا — ${totalHours} ساعة)</span></div>
+            <div class="cname">${escapeHtml(semesterLabel(cur.level))} <span class="muted">(${list.length} مقررًا — ${totalHours} ساعة — ${escapeHtml(yearLabel(cur.level))})</span></div>
             <div class="cmeta">${list.map(c=>escapeHtml(c.code+' — '+c.name)).join('، ') || 'لا توجد مقررات محدَّدة بعد لهذا الفصل الدراسي'}</div>
           </div>
           ${perm('canManageCatalog')? `<div class="row"><button class="icon-btn" onclick="openCurriculumLevelModal('${deptId}',${cur.level})" title="تعديل">✏️</button></div>`:''}
@@ -2398,7 +2590,7 @@ function openCurriculumLevelModal(departmentId, existingLevel){
     (editId ? dbGet('curricula', editId) : Promise.resolve(null)).then(editing=>{
       const selected = new Set((editing&&editing.courseIds)||[]);
       window.__curCourses = courses;
-      openModal(editing?`تعديل مقررات الفصل الدراسي ${existingLevel}`:'إضافة فصل دراسي جديد للمنهج', `
+      openModal(editing?`تعديل مقررات ${semesterLabel(existingLevel)}`:'إضافة فصل دراسي جديد للمنهج', `
         <div class="field"><label for="cu-level">رقم الفصل الدراسي</label><input id="cu-level" type="number" min="1" max="12" value="${editing?editing.level:''}" ${editing?'disabled':''}></div>
         <div class="field"><label>مقررات هذا الفصل الدراسي (ثابتة لجميع طلاب القسم فيه)</label>
           <div style="max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;">
@@ -2422,8 +2614,70 @@ async function submitCurriculumLevel(departmentId){
   const courseIds = courses.filter(c=> document.getElementById('cu-'+c.id) && document.getElementById('cu-'+c.id).checked).map(c=>c.id);
   const id = departmentId+'__'+level;
   await dbPut('curricula', {id, departmentId, level, courseIds, updatedAt:new Date().toISOString()});
-  await addLog('حفظ منهج فصل دراسي', `${departmentId} — الفصل الدراسي ${level} (${courseIds.length} مقررًا)`);
+  await addLog('حفظ منهج فصل دراسي', `${departmentId} — ${semesterLabel(level)} (${courseIds.length} مقررًا)`);
   closeModal(); toast('تم الحفظ'); navigate('curricula',{deptId:departmentId});
+}
+
+/* ---- استيراد المنهج الدراسي من ملف (رمز مقرر + فصل دراسي)، مع دمج آمن دون استبدال ---- */
+function downloadCurriculumTemplate(){
+  let csv = 'رمز المقرر,الفصل الدراسي\n';
+  csv += 'CS101,1\nCS102,1\nCS201,2\n';
+  downloadFile('نموذج_استيراد_منهج.csv', '﻿'+csv, 'text/csv;charset=utf-8');
+}
+async function openImportCurriculumModal(departmentId){
+  openModal('استيراد المنهج من ملف', `
+    <p class="muted" style="line-height:1.9;">يحتوي الملف على عمودين: «رمز المقرر» و«الفصل الدراسي» (رقم). يُطابَق كل رمز مقرر بدليل المقررات ضمن كلية هذا القسم، وتُضاف المقررات لمنهج كل فصل دراسي — مع دمج آمن مع أي مقررات محددة مسبقًا (دون حذفها).</p>
+    <button class="btn btn-outline btn-sm" onclick="downloadCurriculumTemplate()">⬇️ تنزيل نموذج الملف</button>
+    <div class="field"><label for="ic-file">ملف المنهج (Excel أو CSV)</label><input type="file" id="ic-file" accept=".xlsx,.xls,.csv"></div>
+    <div class="err-text" id="ic-err"></div>
+  `, `
+    <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+    <button class="btn btn-gold" onclick="submitImportCurriculum('${departmentId}')">استيراد</button>
+  `);
+}
+async function submitImportCurriculum(departmentId){
+  const err = document.getElementById('ic-err'); err.classList.remove('show');
+  const fileInput = document.getElementById('ic-file');
+  if(!fileInput.files[0]){ err.textContent='الرجاء اختيار الملف'; err.classList.add('show'); return; }
+  const dept = await dbGet('departments', departmentId);
+  if(!dept){ err.textContent='القسم غير موجود'; err.classList.add('show'); return; }
+  let rows;
+  try{ rows = await readSpreadsheetRows(fileInput.files[0]); }
+  catch(e){ err.textContent='تعذّر قراءة الملف — تأكد أنه Excel أو CSV صحيح'; err.classList.add('show'); return; }
+  if(!rows.length){ err.textContent='الملف فارغ'; err.classList.add('show'); return; }
+  const codeKey = findColumnKey(rows[0], ['رمزالمقرر','الرمز','code']);
+  const levelKey = findColumnKey(rows[0], ['الفصلالدراسي','المستوى','الفصل','level']);
+  if(!codeKey || !levelKey){ err.textContent='تعذّر التعرّف على عمودي «رمز المقرر» و«الفصل الدراسي» — تحقق من عناوين الأعمدة'; err.classList.add('show'); return; }
+  const collegeCourses = (await dbGetAll('courses')).filter(c=>c.college===dept.college);
+  const byLevel = {}; // level -> Set(courseIds)
+  const skipped = [];
+  let created = 0;
+  for(const row of rows){
+    const code = String(row[codeKey]||'').trim();
+    const levelRaw = String(row[levelKey]||'').trim();
+    const level = parseInt(levelRaw,10);
+    if(!code || !level || level<1){ skipped.push({code, level:levelRaw, reason:'رمز مقرر أو فصل دراسي مفقود/غير صالح'}); continue; }
+    const course = collegeCourses.find(c=>c.code===code);
+    if(!course){ skipped.push({code, level:levelRaw, reason:'رمز المقرر غير موجود في دليل مقررات كلية هذا القسم'}); continue; }
+    if(!byLevel[level]) byLevel[level] = new Set();
+    if(!byLevel[level].has(course.id)) created++;
+    byLevel[level].add(course.id);
+  }
+  for(const levelStr of Object.keys(byLevel)){
+    const level = parseInt(levelStr,10);
+    const id = departmentId+'__'+level;
+    const existing = await dbGet('curricula', id);
+    const merged = new Set((existing&&existing.courseIds)||[]);
+    byLevel[level].forEach(cid=> merged.add(cid));
+    await dbPut('curricula', {id, departmentId, level, courseIds:[...merged], updatedAt:new Date().toISOString()});
+  }
+  await addLog('استيراد منهج من ملف', `${dept.name} — ${created} مقرر مُضاف/مدموج عبر ${Object.keys(byLevel).length} فصل دراسي، ${skipped.length} صف متخطّى`);
+  toast(`تم الاستيراد: ${created} إضافة، ${skipped.length} صف متخطّى`);
+  closeModal();
+  openModal('نتيجة استيراد المنهج', `
+    <div class="hint-box good-box">تم دمج ${created} مقررًا ضمن ${Object.keys(byLevel).length} فصل دراسي بنجاح.</div>
+    ${skipped.length? `<div class="hint-box warn-box">تم تخطّي ${skipped.length} صف: ${skipped.map(s=>escapeHtml((s.code||'—')+' / '+(s.level||'—'))+' ('+escapeHtml(s.reason)+')').join('، ')}</div>`:''}
+  `, `<button class="btn btn-gold" onclick="closeModal(); navigate('curricula',{deptId:'${departmentId}'});">حسنًا</button>`);
 }
 
 /* ==================== الفصول الدراسية والشُعب ==================== */
@@ -2930,6 +3184,14 @@ async function renderReports(){
   const byLevel = {};
   students.forEach(s=>{ const lvl = s.currentLevel||1; byLevel[lvl] = (byLevel[lvl]||0)+1; });
   const maxLevelCount = Math.max(1, ...Object.values(byLevel));
+  const byBatch = {};
+  students.forEach(s=>{ const b = s.batch||'—'; byBatch[b] = (byBatch[b]||0)+1; });
+  const maxBatchCount = Math.max(1, ...Object.values(byBatch));
+  const batchEntries = Object.entries(byBatch).sort((a,b)=>{
+    const na = Number(a[0]), nb = Number(b[0]);
+    if(!isNaN(na) && !isNaN(nb)) return na-nb;
+    return String(a[0]).localeCompare(String(b[0]));
+  });
   const allRequests = (await dbGetAll('registrationRequests')).filter(r=>!scope || r.college===scope);
   const byStatus = {pending:0, approved:0, rejected:0};
   allRequests.forEach(r=> byStatus[r.status] = (byStatus[r.status]||0)+1);
@@ -2953,10 +3215,18 @@ async function renderReports(){
         <h2>توزيع الطلاب حسب الفصل الدراسي</h2>
         ${Object.entries(byLevel).sort((a,b)=>Number(a[0])-Number(b[0])).map(([lvl,n])=>`
           <div style="margin-bottom:10px;">
-            <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>الفصل الدراسي ${escapeHtml(lvl)}</span><span>${n}</span></div>
+            <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>${escapeHtml(semesterLabel(lvl))}</span><span>${n}</span></div>
             <div class="bar-outer"><div class="bar-inner" style="width:${(n/maxLevelCount)*100}%"></div></div>
           </div>`).join('') || '<div class="muted">لا توجد بيانات</div>'}
       </div>
+    </div>
+    <div class="card">
+      <h2>توزيع الطلاب حسب الدفعة</h2>
+      ${batchEntries.map(([b,n])=>`
+        <div style="margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>${escapeHtml(b)}</span><span>${n}</span></div>
+          <div class="bar-outer"><div class="bar-inner" style="width:${(n/maxBatchCount)*100}%"></div></div>
+        </div>`).join('') || '<div class="muted">لا توجد بيانات</div>'}
     </div>
     <div class="card">
       <h2>حالة طلبات التسجيل المالية</h2>
@@ -3103,9 +3373,9 @@ async function renderSettings(){
     <div class="card">
       <h2>تصدير متوافق مع نظام السجل الأكاديمي الإلكتروني</h2>
       <p class="muted" style="line-height:1.9;">
-        يصدّر هذا الخيار سجلات الطلاب بنفس شكل الحقول المستخدَم في نظام السجل الأكاديمي الإلكتروني لجامعة زالنجي
-        (id, name, college, regNo, gender, batch, specialization, department, createdAt, updatedAt, deleted)،
-        بحيث يمكن للمسؤول استيرادها يدويًا هناك لإكمال دورة حياة الطالب من التسجيل حتى رصد الدرجات والتخرج.
+        يصدّر هذا الخيار سجلات الطلاب بصيغة CSV تحتوي الأعمدة التالية:
+        رقم_جامعي، رقم_التسجيل، اسم_الطالب، الكلية، الدفعة، الفصل_الدراسي، السنة_الدراسية —
+        بحيث يمكن للمسؤول استيرادها يدويًا في نظام السجل الأكاديمي الإلكتروني لإكمال دورة حياة الطالب من التسجيل حتى رصد الدرجات والتخرج.
       </p>
       <button class="btn btn-gold" onclick="exportAcademicRecordCompatible()">تنزيل بيانات الطلاب (متوافقة)</button>
     </div>
@@ -3132,14 +3402,17 @@ async function importFullBackup(file){
   }catch(e){ toast('تعذّر قراءة الملف — تأكد أنه نسخة احتياطية صحيحة', true); }
 }
 async function exportAcademicRecordCompatible(){
-  const students = (await dbGetAll('students')).filter(s=>!s.deleted);
-  const compatible = students.map(s=>({
-    id:s.id, name:s.name, college:s.college, regNo:s.regNo||null, gender:s.gender||null,
-    batch:s.batch||null, specialization:s.specialization||null, department:s.department||null,
-    createdAt:s.createdAt, updatedAt:s.updatedAt, deleted:false,
-  }));
-  downloadFile(`طلاب_متوافق_مع_السجل_الأكاديمي_${todayISO()}.json`, JSON.stringify(compatible,null,2));
-  await addLog('تصدير بيانات طلاب متوافقة مع السجل الأكاديمي', `${compatible.length} سجل`);
+  const scope = myCollegeScope();
+  const students = (await dbGetAll('students')).filter(s=>!s.deleted && (!scope||s.college===scope));
+  let csv = [csvField('رقم_جامعي'), csvField('رقم_التسجيل'), csvField('اسم_الطالب'), csvField('الكلية'), csvField('الدفعة'), csvField('الفصل_الدراسي'), csvField('السنة_الدراسية')].join(',') + '\n';
+  students.forEach(s=>{
+    csv += [
+      csvField(s.id), csvField(s.regNo||''), csvField(s.name), csvField(collegeLabel(s.college)),
+      csvField(s.batch||''), csvField(semesterLabel(s.currentLevel||1)), csvField(yearLabel(s.currentLevel||1)),
+    ].join(',') + '\n';
+  });
+  downloadFile(`بيانات_طلاب_متوافقة_مع_السجل_الأكاديمي_${todayISO()}.csv`, '﻿'+csv, 'text/csv;charset=utf-8');
+  await addLog('تصدير بيانات طلاب متوافقة مع السجل الأكاديمي', `${students.length} سجل`);
   toast('تم التنزيل');
 }
 
@@ -3329,8 +3602,8 @@ async function renderMyRegistration(){
       ${semPickerHtml}
       ${semFinanceHtml}
       ${rejectedReq? `<div class="hint-box warn-box">تم رفض طلبك السابق${rejectedReq.reviewNote?': '+escapeHtml(rejectedReq.reviewNote):''}. يمكنك تقديم طلب جديد بإيصال صحيح أدناه.</div>`:''}
-      <div class="hint-box">مقرراتك هذا الفصل ثابتة حسب منهج الفصل الدراسي ${level} لقسمك، ولا حاجة لاختيار الساعات يدويًا. يتطلب التسجيل إرفاق رقم إيصال التوريد المالي وصورة/ملف الإيصال.</div>
-      ${!curriculum? `<div class="hint-box warn-box">لم يُحدَّد بعد منهج الفصل الدراسي ${level} لقسمك — يرجى مراجعة إدارة القبول والتسجيل.</div>` : ''}
+      <div class="hint-box">مقرراتك هذا الفصل ثابتة حسب منهج ${semesterLabel(level)} لقسمك، ولا حاجة لاختيار الساعات يدويًا. يتطلب التسجيل إرفاق رقم إيصال التوريد المالي وصورة/ملف الإيصال.</div>
+      ${!curriculum? `<div class="hint-box warn-box">لم يُحدَّد بعد منهج ${semesterLabel(level)} لقسمك — يرجى مراجعة إدارة القبول والتسجيل.</div>` : ''}
       <div class="table-wrap"><table>
         <thead><tr><th>المقرر</th><th>الساعات</th><th>الحالة</th></tr></thead>
         <tbody>${rows.map(r=>`<tr>
@@ -3515,6 +3788,7 @@ async function renderMyProfile(){
         <div><div class="muted">الكلية</div><div>${escapeHtml(collegeLabel(student.college))}</div></div>
         <div><div class="muted">القسم/التخصص</div><div>${escapeHtml(student.department||'—')}</div></div>
         <div><div class="muted">الدفعة</div><div>${escapeHtml(student.batch||'—')}</div></div>
+        <div><div class="muted">الفصل الدراسي الحالي</div><div>${escapeHtml(semesterLabel(student.currentLevel||1))} (${escapeHtml(yearLabel(student.currentLevel||1))})</div></div>
         <div><div class="muted">المدرسة الثانوية</div><div>${escapeHtml(student.secondarySchool||'—')}</div></div>
         <div><div class="muted">الهاتف</div><div>${escapeHtml(student.phone||'—')}</div></div>
       </div>
@@ -3556,6 +3830,7 @@ async function changeMyPassword(){
   await addLog('تغيير كلمة مرور طالب');
   ok.textContent='تم تحديث كلمة المرور بنجاح'; ok.classList.add('show');
   document.getElementById('pw-old').value=''; document.getElementById('pw-new').value=''; document.getElementById('pw-new2').value='';
+  refreshNotifBadge();
 }
 </script>
 </body>
