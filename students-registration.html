@@ -149,6 +149,8 @@
   .bar-outer{background:var(--paper-2);border-radius:8px;height:10px;overflow:hidden;width:100%;}
   .bar-inner{background:linear-gradient(90deg,var(--navy),var(--navy-2));height:100%;border-radius:8px;}
   .bar-inner.full{background:linear-gradient(90deg,var(--warn),#d9705b);}
+  .stack-bar{display:flex;height:16px;border-radius:8px;overflow:hidden;background:var(--paper-2);gap:2px;}
+  .stack-seg{height:100%;min-width:2px;}
 
   .empty-state{text-align:center;padding:50px 20px;color:var(--ink-soft);}
   .empty-state .icon{font-size:40px;margin-bottom:10px;}
@@ -316,6 +318,7 @@ function uid(){ return (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Date.now
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDate(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleDateString('ar-EG',{year:'numeric',month:'2-digit',day:'2-digit'}); }catch(e){ return iso; } }
 function fmtDateTime(iso){ if(!iso) return '—'; try{ const d=new Date(iso); return d.toLocaleString('ar-EG'); }catch(e){ return iso; } }
+function fmtMoney(n){ const v = Number(n); if(!v && v!==0) return '—'; return v.toLocaleString('ar-EG')+' ج.س'; }
 function todayISO(){ return new Date().toISOString().slice(0,10); }
 function downloadFile(filename, content, mime){
   const blob = new Blob([content], {type: mime||'application/json'});
@@ -345,6 +348,9 @@ async function readSpreadsheetRows(file){
   const name = (file.name||'').toLowerCase();
   if(name.endsWith('.csv') || file.type==='text/csv'){
     return parseCsvText(await file.text());
+  }
+  if(name.endsWith('.xls')){
+    return parseXlsFile(file);
   }
   return parseXlsxFile(file);
 }
@@ -472,6 +478,281 @@ async function inflateRaw(compressed){
   const buf = await new Response(stream).arrayBuffer();
   return new Uint8Array(buf);
 }
+
+/* ==========================================================================
+   قارئ ملفات .xls القديمة (Excel 97-2003) — تنسيق BIFF8 داخل حاوية
+   OLE Compound File Binary. مكتوب بالكامل بأدوات المتصفح الأساسية (DataView)
+   بدون أي مكتبة خارجية أو اتصال شبكة، تمامًا كقارئ xlsx أعلاه. يدعم: جدول
+   السلاسل النصية المشتركة (SST) مع امتداده عبر سجلات CONTINUE، الخلايا
+   الرقمية (NUMBER/RK/MULRK)، النصية (LABELSST/LABEL)، الفارغة (BLANK)،
+   والصيغ ذات النتيجة المخزَّنة (FORMULA+STRING). يقرأ ورقة العمل الأولى فقط
+   (مطابقةً لسلوك قارئ xlsx أعلاه).
+   ========================================================================== */
+async function parseXlsFile(file){
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const streams = parseOleCfb(bytes);
+  const wb = streams.find(e=>/^(Workbook|Book)$/i.test(e.name));
+  if(!wb) throw new Error('لم يتم العثور على بيانات المصنّف داخل ملف xls — تأكد أنه ملف Excel 97-2003 صالح');
+  return parseBiff8ToRows(wb.data);
+}
+function __xlsConcatU8(chunks, exactSize){
+  const total = exactSize!=null && exactSize>=0 ? exactSize : chunks.reduce((s,c)=>s+c.length,0);
+  const out = new Uint8Array(total);
+  let off=0;
+  for(const c of chunks){ const len = Math.min(c.length, total-off); out.set(c.subarray(0,len), off); off+=len; if(off>=total) break; }
+  return out;
+}
+/* محلل بسيط لحاوية OLE CFB (FAT + Mini-FAT) — يكفي لاستخراج تيار Workbook/Book */
+function parseOleCfb(bytes){
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const sig = [0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1];
+  for(let i=0;i<8;i++){ if(bytes[i]!==sig[i]) throw new Error('الملف ليس بصيغة xls (OLE) صحيحة'); }
+  const sectorShift = dv.getUint16(30, true);
+  const sectorSize = 1<<sectorShift;
+  const miniSectorShift = dv.getUint16(32, true);
+  const miniSectorSize = 1<<miniSectorShift;
+  const dirStart = dv.getUint32(48, true);
+  const miniCutoff = dv.getUint32(56, true);
+  const miniFatStart = dv.getUint32(60, true);
+  const numMiniFatSectors = dv.getUint32(64, true);
+  const difStart = dv.getUint32(68, true);
+  const numDifSectors = dv.getUint32(72, true);
+
+  const fatSectors = [];
+  for(let i=0;i<109;i++){ const v = dv.getUint32(76+i*4, true); if(v!==0xFFFFFFFF) fatSectors.push(v); }
+  let difSector = difStart;
+  for(let i=0;i<numDifSectors;i++){
+    const off = 512 + difSector*sectorSize;
+    for(let j=0;j<sectorSize/4-1;j++){ const v = dv.getUint32(off+j*4, true); if(v!==0xFFFFFFFF) fatSectors.push(v); }
+    difSector = dv.getUint32(off+sectorSize-4, true);
+    if(difSector===0xFFFFFFFE || difSector===0xFFFFFFFF) break;
+  }
+  const fatEntriesPerSector = sectorSize/4;
+  const fat = new Int32Array(fatSectors.length*fatEntriesPerSector);
+  fatSectors.forEach((secId, idx)=>{
+    const off = 512 + secId*sectorSize;
+    for(let j=0;j<fatEntriesPerSector;j++){ fat[idx*fatEntriesPerSector+j] = dv.getInt32(off+j*4, true); }
+  });
+  function readChain(startSector, size, useMini, miniData, miniFat){
+    const chunks = []; let sector = startSector; let remaining = size;
+    const fatTable = useMini ? miniFat : fat;
+    const secSize = useMini ? miniSectorSize : sectorSize;
+    const source = useMini ? miniData : bytes;
+    const baseOff = useMini ? 0 : 512;
+    let guard = 0;
+    while(sector!==-2 && sector>=0 && guard<1000000){
+      const off = baseOff + sector*secSize;
+      chunks.push(source.subarray(off, off+secSize));
+      remaining -= secSize;
+      sector = fatTable[sector];
+      guard++;
+    }
+    return __xlsConcatU8(chunks, size!=null && size>=0 ? size : undefined);
+  }
+  const dirBytes = readChain(dirStart, -1, false);
+  const entries = [];
+  for(let off=0; off+128<=dirBytes.length; off+=128){
+    const edv = new DataView(dirBytes.buffer, dirBytes.byteOffset+off, 128);
+    const nameLen = edv.getUint16(64, true);
+    if(nameLen<2) continue;
+    let name = '';
+    for(let i=0;i<nameLen-2;i+=2){ name += String.fromCharCode(dirBytes[off+i] | (dirBytes[off+i+1]<<8)); }
+    const type = dirBytes[off+66];
+    const startSec = edv.getUint32(116, true);
+    const size = edv.getUint32(120, true);
+    if(type===2 || type===5){ entries.push({name, type, startSec, size}); }
+  }
+  const root = entries.find(e=>e.type===5);
+  let miniData = new Uint8Array(0), miniFat = new Int32Array(0);
+  if(root && numMiniFatSectors>0){
+    miniData = readChain(root.startSec, root.size, false);
+    const miniFatBytes = readChain(miniFatStart, -1, false);
+    miniFat = new Int32Array(Math.floor(miniFatBytes.length/4));
+    const mv = new DataView(miniFatBytes.buffer, miniFatBytes.byteOffset, miniFatBytes.byteLength);
+    for(let i=0;i<miniFat.length;i++) miniFat[i]=mv.getInt32(i*4, true);
+  }
+  return entries.filter(e=>e.type===2).map(e=>{
+    const useMini = e.size < miniCutoff;
+    const data = readChain(e.startSec, e.size, useMini, miniData, miniFat);
+    return {name:e.name, data};
+  });
+}
+/* قراءة جدول السلاسل النصية المشتركة (SST) عبر مقاطعها (السجل الأصلي + سجلات CONTINUE التالية له) */
+function __xlsReadSstStrings(segments, uniqueCount){
+  let segIdx=0, pos=0;
+  function atEnd(){ return segIdx>=segments.length; }
+  function skipEmpty(){ while(!atEnd() && pos>=segments[segIdx].length){ segIdx++; pos=0; } }
+  function readU8(){ skipEmpty(); if(atEnd()) return 0; const b=segments[segIdx][pos]; pos++; return b; }
+  function readU16(){ const lo=readU8(); const hi=readU8(); return lo|(hi<<8); }
+  function readU32(){ const lo=readU16(); const hi=readU16(); return (lo|(hi<<16))>>>0; }
+  function readChars(remaining, highByteInit){
+    let out=''; let highByte = highByteInit;
+    while(remaining>0){
+      skipEmpty();
+      if(atEnd()) break;
+      if(highByte){
+        const lo = segments[segIdx][pos]; pos++;
+        skipEmpty();
+        let hi = 0;
+        if(!atEnd() && pos<segments[segIdx].length){ hi = segments[segIdx][pos]; pos++; }
+        out += String.fromCharCode(lo | (hi<<8));
+      } else {
+        out += String.fromCharCode(segments[segIdx][pos]); pos++;
+      }
+      remaining--;
+      // عبور حد سجل CONTINUE أثناء قراءة أحرف سلسلة واحدة يتطلب بايت أعلام جديدًا قبل المتابعة
+      if(remaining>0){
+        while(!atEnd() && pos>=segments[segIdx].length){
+          segIdx++; pos=0;
+          if(!atEnd() && segments[segIdx].length>0){ const nf=segments[segIdx][pos]; pos++; highByte = nf & 0x1; }
+        }
+      }
+    }
+    return out;
+  }
+  const strings=[];
+  for(let i=0;i<uniqueCount;i++){
+    const cch = readU16();
+    const flags = readU8();
+    const fHighByte = flags & 0x1;
+    const fExtSt = flags & 0x4;
+    const fRichSt = flags & 0x8;
+    let cRun=0, cbExtRst=0;
+    if(fRichSt) cRun = readU16();
+    if(fExtSt) cbExtRst = readU32();
+    const text = readChars(cch, !!fHighByte);
+    if(fRichSt){ for(let k=0;k<cRun;k++) readU32(); }
+    if(fExtSt){ for(let k=0;k<cbExtRst;k++) readU8(); }
+    strings.push(text);
+  }
+  return strings;
+}
+function __xlsDecodeRk(rk){
+  const fX100 = rk & 0x1;
+  const fInt = rk & 0x2;
+  let value;
+  if(fInt){ value = rk >> 2; }
+  else{
+    const buf = new ArrayBuffer(8); const dv2 = new DataView(buf);
+    dv2.setInt32(0, 0, true);
+    dv2.setInt32(4, rk & 0xFFFFFFFC, true);
+    value = dv2.getFloat64(0, true);
+  }
+  if(fX100) value = value/100;
+  return value;
+}
+function __xlsSetCell(grid, r, c, v){ if(!grid[r]) grid[r]=[]; grid[r][c]=v; }
+function __xlsInlineUnicodeString(body, cchOffset, flagsOffset){
+  const bd = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  const cch = bd.getUint16(cchOffset, true);
+  const flags = body[flagsOffset];
+  const highByte = flags & 0x1;
+  let str=''; let p = flagsOffset+1;
+  for(let k=0;k<cch && p<body.length;k++){
+    if(highByte){ if(p+1<body.length){ str += String.fromCharCode(body[p] | (body[p+1]<<8)); } p+=2; }
+    else { str += String.fromCharCode(body[p]); p+=1; }
+  }
+  return str;
+}
+function __xlsPeekRecord(dv, pos, data){
+  if(pos+4>data.length) return null;
+  const id = dv.getUint16(pos, true);
+  const len = dv.getUint16(pos+2, true);
+  if(pos+4+len>data.length) return null;
+  return {id, body:data.subarray(pos+4,pos+4+len), nextPos:pos+4+len};
+}
+/* مسح تسلسلي لسجلات BIFF8 داخل تيار Workbook — يجمع SST من قسم الإعدادات العامة
+   ثم خلايا ورقة العمل الأولى فقط (BOF بنوع 0x0010) ويتوقف عند EOF الخاص بها */
+function parseBiff8ToRows(data){
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let pos = 0;
+  let sst = [];
+  let sheetGrid = [];
+  let inSheet = false, sheetDone = false;
+  while(pos + 4 <= data.length && !sheetDone){
+    const id = dv.getUint16(pos, true);
+    const len = dv.getUint16(pos+2, true);
+    const bodyStart = pos+4;
+    if(bodyStart+len > data.length) break;
+    const body = data.subarray(bodyStart, bodyStart+len);
+
+    if(id===0x00FC){ // SST
+      let p2 = bodyStart+len;
+      const segments = [body.subarray(8)];
+      while(p2+4<=data.length){
+        const nid = dv.getUint16(p2, true);
+        const nlen = dv.getUint16(p2+2, true);
+        if(nid!==0x003C) break;
+        if(p2+4+nlen>data.length) break;
+        segments.push(data.subarray(p2+4, p2+4+nlen));
+        p2 += 4+nlen;
+      }
+      const bodyDv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+      const uniqueCount = bodyDv.getUint32(4, true);
+      sst = __xlsReadSstStrings(segments, uniqueCount);
+      pos = p2; continue;
+    }
+    if(id===0x0809){ // BOF
+      const dt = body.length>=4 ? new DataView(body.buffer,body.byteOffset,body.byteLength).getUint16(2, true) : 0;
+      if(dt===0x0010 && !sheetDone && !inSheet){ inSheet = true; }
+    } else if(id===0x000A){ // EOF
+      if(inSheet){ sheetDone = true; }
+    } else if(inSheet){
+      const bd = body.length>=6 ? new DataView(body.buffer,body.byteOffset,body.byteLength) : null;
+      if(id===0x0203 && bd){ // NUMBER
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true), v=bd.getFloat64(6,true);
+        __xlsSetCell(sheetGrid, r, c, v);
+      } else if(id===0x027E && bd){ // RK
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true), rk=bd.getInt32(6,true);
+        __xlsSetCell(sheetGrid, r, c, __xlsDecodeRk(rk));
+      } else if(id===0x00BD && bd){ // MULRK
+        const r=bd.getUint16(0,true), c0=bd.getUint16(2,true);
+        let off=4, col=c0;
+        while(off+6<=body.length-2){
+          const rk = bd.getInt32(off+2, true);
+          __xlsSetCell(sheetGrid, r, col, __xlsDecodeRk(rk));
+          col++; off+=6;
+        }
+      } else if(id===0x00FD && bd){ // LABELSST
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true), isst=bd.getUint32(6,true);
+        __xlsSetCell(sheetGrid, r, c, sst[isst]!==undefined?sst[isst]:'');
+      } else if(id===0x0204 && bd){ // LABEL
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true);
+        __xlsSetCell(sheetGrid, r, c, __xlsInlineUnicodeString(body, 6, 8));
+      } else if(id===0x0201 && bd){ // BLANK
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true);
+        __xlsSetCell(sheetGrid, r, c, '');
+      } else if(id===0x0006 && bd && body.length>=14){ // FORMULA (نتيجة مخزَّنة فقط، دون تقييم الصيغة)
+        const r=bd.getUint16(0,true), c=bd.getUint16(2,true);
+        const marker=bd.getUint16(6,true);
+        if(marker===0xFFFF){
+          const kind = body[12];
+          if(kind===0){
+            const next = __xlsPeekRecord(dv, bodyStart+len, data);
+            if(next && next.id===0x0207){
+              __xlsSetCell(sheetGrid, r, c, __xlsInlineUnicodeString(next.body, 0, 2));
+              pos = next.nextPos; continue;
+            }
+            __xlsSetCell(sheetGrid, r, c, '');
+          } else if(kind===1){ __xlsSetCell(sheetGrid, r, c, body[6]?true:false); }
+          else { __xlsSetCell(sheetGrid, r, c, ''); }
+        } else {
+          __xlsSetCell(sheetGrid, r, c, bd.getFloat64(6,true));
+        }
+      }
+    }
+    pos = bodyStart+len;
+  }
+  const rows = sheetGrid.filter(Boolean);
+  if(!rows.length) return [];
+  const header = (rows[0]||[]).map(h=> (h==null?'':String(h)).trim());
+  return rows.slice(1).map(rowArr=>{
+    const obj={};
+    header.forEach((h,i)=>{ const v=(rowArr||[])[i]; obj[h] = (v!==undefined && v!==null) ? String(v) : ''; });
+    return obj;
+  });
+}
+
 function findColumnKey(sampleRow, candidates){
   const keys = Object.keys(sampleRow||{});
   const norm = s => String(s).replace(/[\sً-ْ]/g,'').trim();
@@ -646,7 +927,7 @@ async function generateRegNo(departmentId, admissionYear){
 
 /* ==================== إنشاء سجل طالب من كشف قبول الوزارة ==================== */
 async function createStudentFromAdmission(data){
-  const { studentId, name, secondarySchool, college, departmentId, year, phone, gender } = data;
+  const { studentId, name, secondarySchool, college, departmentId, year, phone, gender, specialization, notes } = data;
   if(!studentId) throw new Error('الرجاء إدخال الرقم الجامعي');
   if(!name) throw new Error('الرجاء إدخال اسم الطالب');
   if(!college) throw new Error('الرجاء اختيار الكلية');
@@ -657,8 +938,10 @@ async function createStudentFromAdmission(data){
   const regNo = await generateRegNo(departmentId, year);
   const tempPw = genTempPassword();
   const row = {
-    id: studentId, name, college, departmentId, department: dept?dept.name:null, specialization: dept?dept.name:null,
+    id: studentId, name, college, departmentId, department: dept?dept.name:null,
+    specialization: (specialization&&specialization.trim()) ? specialization.trim() : (dept?dept.name:null),
     secondarySchool: secondarySchool||null, regNo, gender: gender||null, batch:String(year), phone: phone||null, email:null,
+    notes: notes||null,
     status:'active', isGraduate:false, completedCourses:[],
     currentLevel:1, blockFlags:[], levelAdvancedForSemesters:[],
     createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), deleted:false,
@@ -749,18 +1032,24 @@ function __sbMap(table, r){
   switch(table){
     case 'students': return {id:r.id, name:r.name, college:r.college||null, department_id:r.departmentId||null, department:r.department||null,
       specialization:r.specialization||null, secondary_school:r.secondarySchool||null, reg_no:r.regNo||null, gender:r.gender||null,
-      batch:r.batch||null, phone:r.phone||null, email:r.email||null, status:r.status||'active', is_graduate:!!r.isGraduate,
+      batch:r.batch||null, phone:r.phone||null, email:r.email||null, notes:r.notes||null, status:r.status||'active', is_graduate:!!r.isGraduate,
       completed_courses:r.completedCourses||[], current_level:r.currentLevel||1, block_flags:r.blockFlags||[],
-      level_advanced_for_semesters:r.levelAdvancedForSemesters||[], auth_salt:r.authSalt||null, auth_hash:r.authHash||null,
+      level_advanced_for_semesters:r.levelAdvancedForSemesters||[],
+      prior_result_status:r.priorResultStatus||null, prior_result_for_level:r.priorResultForLevel||null, prior_result_note:r.priorResultNote||null,
+      auth_salt:r.authSalt||null, auth_hash:r.authHash||null,
       created_at:r.createdAt, updated_at:r.updatedAt||new Date().toISOString(), deleted:!!r.deleted};
     case 'departments': return {id:r.id, name:r.name, code:r.code, college:r.college, updated_at:new Date().toISOString()};
     case 'courses': return {id:r.id, code:r.code, name:r.name, college:r.college, credit_hours:r.creditHours, level:r.level||null, prerequisites:r.prerequisites||[], updated_at:new Date().toISOString()};
     case 'curricula': return {id:r.id, department_id:r.departmentId, level:r.level, course_ids:r.courseIds||[], updated_at:r.updatedAt||new Date().toISOString()};
-    case 'semesters': return {id:r.id, name:r.name, reg_start:r.regStart||null, reg_end:r.regEnd||null, reg_open:!!r.regOpen, created_at:r.createdAt, updated_at:new Date().toISOString()};
+    case 'semesters': return {id:r.id, name:r.name, reg_start:r.regStart||null, reg_end:r.regEnd||null, reg_open:!!r.regOpen,
+      reg_fee:r.regFee!=null?r.regFee:null, tuition_fee:r.tuitionFee!=null?r.tuitionFee:null, bank_info:r.bankInfo||null,
+      created_at:r.createdAt, updated_at:new Date().toISOString()};
     case 'offerings': return {id:r.id, semester_id:r.semesterId, course_id:r.courseId, college:r.college, instructor:r.instructor||null, days:r.days||[], start_time:r.startTime||null, end_time:r.endTime||null, room:r.room||null, capacity:r.capacity, created_at:r.createdAt, updated_at:new Date().toISOString()};
     case 'registrations': return {id:r.id, student_id:r.studentId, semester_id:r.semesterId, offering_id:r.offeringId, course_id:r.courseId, credit_hours:r.creditHours, status:r.status, request_id:r.requestId||null, registered_at:r.registeredAt, note:r.note||null, updated_at:new Date().toISOString()};
     case 'registrationRequests': return {id:r.id, student_id:r.studentId, semester_id:r.semesterId, college:r.college, offering_ids:r.offeringIds||[],
       total_hours:r.totalHours, receipt_number:r.receiptNumber||null, receipt_file_name:r.receiptFileName||null, receipt_storage_path:r.receiptStoragePath||null,
+      total_due:r.totalDue!=null?r.totalDue:null, amount_paid:r.amountPaid!=null?r.amountPaid:null, remaining_amount:r.remainingAmount!=null?r.remainingAmount:null,
+      is_partial_payment:!!r.isPartialPayment, partial_reason:r.partialReason||null, payment_history:r.paymentHistory||[],
       submitted_at:r.submittedAt, status:r.status, reviewed_by:r.reviewedBy||null, reviewed_at:r.reviewedAt||null, review_note:r.reviewNote||null, updated_at:new Date().toISOString()};
     case 'academicClearance': return {id:r.id, student_id:r.studentId, semester_id:r.semesterId, status:r.status, note:r.note||null, imported_at:r.importedAt, imported_by:r.importedBy||null};
     case 'users': return {username:r.username, salt:r.salt, hash:r.hash, role:r.role, college:r.college||null, full_name:r.fullName||null, job_title:r.jobTitle||null, phone:r.phone||null, active:r.active!==false, created_at:r.createdAt, updated_at:r.updatedAt||new Date().toISOString()};
@@ -772,17 +1061,21 @@ function __sbUnmap(table, r){
   switch(table){
     case 'students': return {id:r.id, name:r.name, college:r.college, departmentId:r.department_id, department:r.department,
       specialization:r.specialization, secondarySchool:r.secondary_school, regNo:r.reg_no, gender:r.gender, batch:r.batch,
-      phone:r.phone, email:r.email, status:r.status, isGraduate:!!r.is_graduate, completedCourses:r.completed_courses||[],
+      phone:r.phone, email:r.email, notes:r.notes, status:r.status, isGraduate:!!r.is_graduate, completedCourses:r.completed_courses||[],
       currentLevel:r.current_level||1, blockFlags:r.block_flags||[], levelAdvancedForSemesters:r.level_advanced_for_semesters||[],
+      priorResultStatus:r.prior_result_status||null, priorResultForLevel:r.prior_result_for_level||null, priorResultNote:r.prior_result_note||null,
       authSalt:r.auth_salt, authHash:r.auth_hash, createdAt:r.created_at, updatedAt:r.updated_at, deleted:!!r.deleted};
     case 'departments': return {id:r.id, name:r.name, code:r.code, college:r.college};
     case 'courses': return {id:r.id, code:r.code, name:r.name, college:r.college, creditHours:r.credit_hours, level:r.level, prerequisites:r.prerequisites||[]};
     case 'curricula': return {id:r.id, departmentId:r.department_id, level:r.level, courseIds:r.course_ids||[], updatedAt:r.updated_at};
-    case 'semesters': return {id:r.id, name:r.name, regStart:r.reg_start, regEnd:r.reg_end, regOpen:!!r.reg_open, createdAt:r.created_at};
+    case 'semesters': return {id:r.id, name:r.name, regStart:r.reg_start, regEnd:r.reg_end, regOpen:!!r.reg_open,
+      regFee:r.reg_fee, tuitionFee:r.tuition_fee, bankInfo:r.bank_info, createdAt:r.created_at};
     case 'offerings': return {id:r.id, semesterId:r.semester_id, courseId:r.course_id, college:r.college, instructor:r.instructor, days:r.days||[], startTime:r.start_time, endTime:r.end_time, room:r.room, capacity:r.capacity, createdAt:r.created_at};
     case 'registrations': return {id:r.id, studentId:r.student_id, semesterId:r.semester_id, offeringId:r.offering_id, courseId:r.course_id, creditHours:r.credit_hours, status:r.status, requestId:r.request_id, registeredAt:r.registered_at, note:r.note};
     case 'registrationRequests': return {id:r.id, studentId:r.student_id, semesterId:r.semester_id, college:r.college, offeringIds:r.offering_ids||[],
       totalHours:r.total_hours, receiptNumber:r.receipt_number, receiptFileName:r.receipt_file_name, receiptStoragePath:r.receipt_storage_path,
+      totalDue:r.total_due, amountPaid:r.amount_paid, remainingAmount:r.remaining_amount, isPartialPayment:!!r.is_partial_payment,
+      partialReason:r.partial_reason, paymentHistory:r.payment_history||[],
       submittedAt:r.submitted_at, status:r.status, reviewedBy:r.reviewed_by, reviewedAt:r.reviewed_at, reviewNote:r.review_note};
     case 'academicClearance': return {id:r.id, studentId:r.student_id, semesterId:r.semester_id, status:r.status, note:r.note, importedAt:r.imported_at, importedBy:r.imported_by};
     case 'users': return {username:r.username, salt:r.salt, hash:r.hash, role:r.role, college:r.college, fullName:r.full_name, jobTitle:r.job_title, phone:r.phone, active:r.active!==false, createdAt:r.created_at, updatedAt:r.updated_at};
@@ -1200,6 +1493,14 @@ async function renderStudentDashboard(){
 }
 
 /* ==================== الأقسام والتخصصات (رموز رقم التسجيل) ==================== */
+function matchCollegeFromText(text){
+  const t = String(text||'').trim().toLowerCase();
+  if(!t) return null;
+  const byKey = COLLEGES.find(c=>c.key.toLowerCase()===t);
+  if(byKey) return byKey.key;
+  const byLabel = COLLEGES.find(c=> c.label.toLowerCase()===t || c.label.toLowerCase().includes(t) || t.includes(c.label.toLowerCase()));
+  return byLabel ? byLabel.key : null;
+}
 async function renderDepartments(){
   const scope = myCollegeScope();
   let list = await dbGetAll('departments');
@@ -1208,7 +1509,7 @@ async function renderDepartments(){
   document.getElementById('viewport').innerHTML = `
     <div class="card">
       <h2>الأقسام والتخصصات${scope?' — '+escapeHtml(collegeLabel(scope)):''} <span class="eyebrow">${list.length}</span>
-        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openAddDepartmentModal()">+ قسم/تخصص جديد</button>`:''}
+        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openAddDepartmentModal()">+ قسم/تخصص جديد</button> <button class="btn btn-outline btn-sm" onclick="openBulkDepartmentsModal()">📥 استيراد جماعي (Excel)</button>`:''}
       </h2>
       <p class="muted">رمز القسم هو الحرف/الرمز الذي يظهر في الجزء الأوسط من رقم تسجيل الطالب (مثال: 2-ن-22).</p>
       <div class="table-wrap">
@@ -1264,6 +1565,52 @@ async function deleteDepartment(id){
   await addLog('حذف قسم/تخصص', id);
   toast('تم الحذف'); navigate('departments');
 }
+function openBulkDepartmentsModal(){
+  const scope = myCollegeScope();
+  openModal('استيراد أقسام/تخصصات جماعيًا', `
+    <p class="muted" style="line-height:1.9;">أعمدة الملف المطلوبة: «اسم القسم»، «الرمز»${scope?'':'، «الكلية» (اسم الكلية أو مفتاحها)'}. الرمز يجب أن يكون فريدًا داخل نفس الكلية.</p>
+    <div class="field"><label for="dpb-file">ملف الأقسام (Excel أو CSV)</label><input type="file" id="dpb-file" accept=".xlsx,.xls,.csv"></div>
+    <div class="err-text" id="dpb-err"></div>
+  `, `
+    <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+    <button class="btn btn-gold" onclick="submitBulkDepartments()">استيراد</button>
+  `);
+}
+async function submitBulkDepartments(){
+  const scope = myCollegeScope();
+  const err = document.getElementById('dpb-err'); err.classList.remove('show');
+  const fileInput = document.getElementById('dpb-file');
+  if(!fileInput.files[0]){ err.textContent='الرجاء اختيار الملف'; err.classList.add('show'); return; }
+  let rows;
+  try{ rows = await readSpreadsheetRows(fileInput.files[0]); }
+  catch(e){ err.textContent='تعذّر قراءة الملف — تأكد أنه Excel أو CSV صحيح'; err.classList.add('show'); return; }
+  if(!rows.length){ err.textContent='الملف فارغ'; err.classList.add('show'); return; }
+  const nameKey = findColumnKey(rows[0], ['اسمالقسم','القسم','اسمالتخصص','name']);
+  const codeKey = findColumnKey(rows[0], ['الرمز','رمزالقسم','code']);
+  const collegeKey = findColumnKey(rows[0], ['الكلية','college']);
+  if(!nameKey || !codeKey){ err.textContent='تعذّر التعرّف على عمودي «اسم القسم» و«الرمز» — تحقق من عناوين الأعمدة'; err.classList.add('show'); return; }
+  const created=[], skipped=[];
+  for(const row of rows){
+    const name = String(row[nameKey]||'').trim();
+    const code = String(row[codeKey]||'').trim();
+    const college = scope || (collegeKey ? matchCollegeFromText(row[collegeKey]) : null);
+    if(!name || !code){ skipped.push({name, code, reason:'صف بدون اسم أو رمز'}); continue; }
+    if(!college){ skipped.push({name, code, reason:'تعذّر تحديد الكلية'}); continue; }
+    const id = college+'__'+code;
+    try{
+      const existing = await dbGet('departments', id);
+      if(existing) throw new Error('الرمز مستخدم مسبقًا لقسم آخر في نفس الكلية');
+      await dbPut('departments', {id, name, code, college});
+      created.push({name, code, college});
+    }catch(e){ skipped.push({name, code, reason:e.message||'خطأ غير معروف'}); }
+  }
+  await addLog('استيراد أقسام جماعي', `${created.length} قسم تم إضافتهم، ${skipped.length} تم تخطّيهم`);
+  closeModal();
+  openModal('نتيجة استيراد الأقسام', `
+    <div class="hint-box good-box">تم إضافة ${created.length} قسمًا بنجاح.</div>
+    ${skipped.length? `<div class="hint-box warn-box">تم تخطّي ${skipped.length} صف: ${skipped.map(s=>escapeHtml((s.name||s.code||'—'))+' ('+escapeHtml(s.reason)+')').join('، ')}</div>`:''}
+  `, `<button class="btn btn-gold" onclick="closeModal(); navigate('departments');">حسنًا</button>`);
+}
 
 /* ==================== كشوفات القبول من الوزارة ==================== */
 async function renderAdmissions(){
@@ -1311,11 +1658,13 @@ async function openManualAdmissionModal(){
     <div class="field"><label for="ad-school">المدرسة الثانوية</label><input id="ad-school" placeholder="اسم المدرسة التي جلس بها امتحان الثانوية"></div>
     ${!scope? `<div class="field"><label for="ad-college">الكلية</label><select id="ad-college" onchange="refreshAdmissionDeptOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
     <div class="field"><label for="ad-dept">القسم/التخصص</label><select id="ad-dept">${depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>'}</select></div>
+    <div class="field"><label for="ad-spec">التخصص الدقيق (اختياري، إن اختلف عن اسم القسم)</label><input id="ad-spec" placeholder="يُستخدم اسم القسم تلقائيًا إن تُرك فارغًا"></div>
     <div class="row2">
       <div class="field"><label for="ad-year">سنة القبول</label><input id="ad-year" value="${year}" inputmode="numeric"></div>
       <div class="field"><label for="ad-gender">الجنس (اختياري)</label><select id="ad-gender"><option value="">— غير محدد —</option><option value="male">ذكر</option><option value="female">أنثى</option></select></div>
     </div>
     <div class="field"><label for="ad-phone">رقم الهاتف (اختياري)</label><input id="ad-phone"></div>
+    <div class="field"><label for="ad-notes">ملاحظات (اختياري)</label><input id="ad-notes"></div>
     <div class="err-text" id="ad-err"></div>
   `, `
     <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
@@ -1339,9 +1688,11 @@ async function submitManualAdmission(){
   const year = document.getElementById('ad-year').value.trim();
   const phone = document.getElementById('ad-phone').value.trim();
   const gender = document.getElementById('ad-gender').value;
+  const specialization = document.getElementById('ad-spec').value.trim();
+  const notes = document.getElementById('ad-notes').value.trim();
   if(!departmentId){ err.textContent='الرجاء اختيار القسم/التخصص (أضف أقسامًا أولاً من تبويب «الأقسام» إن لم توجد)'; err.classList.add('show'); return; }
   try{
-    const {row, tempPw} = await createStudentFromAdmission({studentId, name, secondarySchool, college, departmentId, year, phone, gender});
+    const {row, tempPw} = await createStudentFromAdmission({studentId, name, secondarySchool, college, departmentId, year, phone, gender, specialization, notes});
     lastAdmissionCollege = college; lastAdmissionYear = year;
     await addLog('تسجيل طالب من كشف قبول', `${name} → ${row.id} (${row.regNo})`);
     closeModal();
@@ -1362,7 +1713,7 @@ async function openBulkAdmissionModal(){
   const depts = await departmentOptionsForCollege(college);
   const year = lastAdmissionYear || new Date().getFullYear();
   openModal('استيراد كشف قبول كامل', `
-    <p class="muted" style="line-height:1.9;">يُطبَّق القسم والكلية وسنة القبول المختارون هنا على كل صفوف الملف. يجب أن يحتوي الملف على عمودين على الأقل بعنوان قريب من: «الرقم الجامعي» و«الاسم»، وعمود اختياري «المدرسة الثانوية».</p>
+    <p class="muted" style="line-height:1.9;">يُطبَّق القسم والكلية وسنة القبول المختارون هنا على كل صفوف الملف. يجب أن يحتوي الملف على عمودين على الأقل بعنوان قريب من: «الرقم الجامعي» و«الاسم»، وأعمدة اختيارية: «المدرسة الثانوية»، «التخصص»، «ملاحظات».</p>
     ${!scope? `<div class="field"><label for="bk-college">الكلية</label><select id="bk-college" onchange="refreshBulkDeptOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
     <div class="field"><label for="bk-dept">القسم/التخصص</label><select id="bk-dept">${depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>'}</select></div>
     <div class="field"><label for="bk-year">سنة القبول</label><input id="bk-year" value="${year}" inputmode="numeric"></div>
@@ -1395,15 +1746,19 @@ async function submitBulkAdmission(){
   const idKey = findColumnKey(rows[0], ['الرقمالجامعي','رقمجامعي','رقمالطالب','id']);
   const nameKey = findColumnKey(rows[0], ['الاسم','اسمالطالب','name']);
   const schoolKey = findColumnKey(rows[0], ['المدرسةالثانوية','المدرسة','الثانوية','school']);
+  const specKey = findColumnKey(rows[0], ['التخصص','specialization']);
+  const notesKey = findColumnKey(rows[0], ['ملاحظات','ملاحظة','notes']);
   if(!idKey || !nameKey){ err.textContent='تعذّر التعرّف على عمودي «الرقم الجامعي» و«الاسم» في الملف — تحقق من عناوين الأعمدة'; err.classList.add('show'); return; }
   const created=[], skipped=[];
   for(const row of rows){
     const studentId = String(row[idKey]||'').trim();
     const name = String(row[nameKey]||'').trim();
     const secondarySchool = schoolKey ? String(row[schoolKey]||'').trim() : '';
+    const specialization = specKey ? String(row[specKey]||'').trim() : '';
+    const notes = notesKey ? String(row[notesKey]||'').trim() : '';
     if(!studentId || !name){ skipped.push({studentId, name, reason:'صف بدون رقم جامعي أو اسم'}); continue; }
     try{
-      const {row:srow, tempPw} = await createStudentFromAdmission({studentId, name, secondarySchool, college, departmentId, year});
+      const {row:srow, tempPw} = await createStudentFromAdmission({studentId, name, secondarySchool, college, departmentId, year, specialization, notes});
       created.push({id:srow.id, name:srow.name, regNo:srow.regNo, tempPw});
     }catch(e){ skipped.push({studentId, name, reason:e.message||'خطأ غير معروف'}); }
   }
@@ -1427,28 +1782,155 @@ function downloadBulkAdmissionCredentials(){
   downloadFile(`بيانات_دخول_دفعة_القبول_${todayISO()}.csv`, '﻿'+csv, 'text/csv;charset=utf-8');
 }
 
+/* ==================== إنشاء سجل «طالب حالي» مستورَد (وليس طالبًا جديدًا) ====================
+   يُستخدم عند ترحيل طلاب موجودين فعلاً في الواقع إلى النظام: رقم التسجيل
+   يُعطى صراحةً (لا يُولَّد)، والمستوى/الفصل الدراسي الحالي يُعطى صراحةً أيضًا
+   (بخلاف كشوفات القبول الجديدة التي تبدأ دائمًا من المستوى 1 تلقائيًا). */
+async function createExistingStudentRecord(data){
+  const { studentId, regNo, name, college, departmentId, specialization, batch, currentLevel, resultStatusRaw } = data;
+  if(!studentId) throw new Error('الرجاء إدخال الرقم الجامعي/الاستمارة');
+  if(!regNo) throw new Error('الرجاء إدخال رقم التسجيل');
+  if(!name) throw new Error('الرجاء إدخال اسم الطالب');
+  if(!college) throw new Error('الرجاء اختيار الكلية');
+  if(!departmentId) throw new Error('الرجاء اختيار القسم/التخصص');
+  const lvl = parseInt(currentLevel,10);
+  if(!lvl || lvl<1) throw new Error('الفصل الدراسي الحالي غير صالح');
+  const allStudents = await dbGetAll('students');
+  if(allStudents.some(s=>s.id===studentId)) throw new Error(`الرقم الجامعي "${studentId}" مستخدم مسبقًا`);
+  if(allStudents.some(s=>s.regNo===regNo)) throw new Error(`رقم التسجيل "${regNo}" مستخدم مسبقًا`);
+  const dept = await dbGet('departments', departmentId);
+  const tempPw = genTempPassword();
+  const row = {
+    id: studentId, name, college, departmentId, department: dept?dept.name:null,
+    specialization: (specialization&&specialization.trim()) ? specialization.trim() : (dept?dept.name:null),
+    secondarySchool: null, regNo, gender: null, batch: batch?String(batch):null, phone: null, email:null,
+    notes: null,
+    status:'active', isGraduate:false, completedCourses:[],
+    currentLevel: lvl, blockFlags:[], levelAdvancedForSemesters:[],
+    createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), deleted:false,
+  };
+  if(resultStatusRaw && String(resultStatusRaw).trim()){
+    row.priorResultStatus = normalizeClearanceStatus(resultStatusRaw);
+    row.priorResultForLevel = lvl;
+    row.priorResultNote = 'مستوردة عبر أداة إضافة مجموعة طلاب (طلاب حاليون)';
+  }
+  await dbPut('students', row);
+  await setStudentPassword(studentId, tempPw);
+  return {row, tempPw};
+}
+async function openBulkExistingStudentsModal(){
+  const scope = myCollegeScope();
+  const college = scope || lastAdmissionCollege || COLLEGES[0].key;
+  const depts = await departmentOptionsForCollege(college);
+  const year = lastAdmissionYear || new Date().getFullYear();
+  openModal('إضافة مجموعة طلاب (طلاب حاليون)', `
+    <p class="muted" style="line-height:1.9;">لطلاب موجودين فعلاً (ليسوا جددًا) — رقم التسجيل والفصل الدراسي الحالي يُؤخذان كما وردا في الملف ولا يُولَّدان تلقائيًا. الأعمدة المطلوبة: «الرقم الجامعي/الاستمارة»، «رقم التسجيل»، «الاسم»، «الفصل الدراسي الحالي». الأعمدة الاختيارية: «التخصص»، «الدفعة»، «النتيجة» (ناجح/ملحق/راسب — تُستخدم فقط إن لم يوجد للطالب سجل تسجيل سابق داخل النظام، وتُطابَق حصرًا بنفس الفصل الحالي المُدخَل).</p>
+    ${!scope? `<div class="field"><label for="ex-college">الكلية</label><select id="ex-college" onchange="refreshExistingDeptOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
+    <div class="field"><label for="ex-dept">القسم/التخصص</label><select id="ex-dept">${depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>'}</select></div>
+    <div class="field"><label for="ex-file">ملف الطلاب (Excel أو CSV)</label><input type="file" id="ex-file" accept=".xlsx,.xls,.csv"></div>
+    <div class="err-text" id="ex-err"></div>
+  `, `
+    <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+    <button class="btn btn-gold" onclick="submitBulkExistingStudents()">استيراد الطلاب</button>
+  `);
+}
+async function refreshExistingDeptOptions(){
+  const collegeEl = document.getElementById('ex-college');
+  const depts = await departmentOptionsForCollege(collegeEl.value);
+  document.getElementById('ex-dept').innerHTML = depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>';
+}
+async function submitBulkExistingStudents(){
+  const scope = myCollegeScope();
+  const err = document.getElementById('ex-err'); err.classList.remove('show');
+  const collegeEl = document.getElementById('ex-college');
+  const college = scope || (collegeEl?collegeEl.value:'');
+  const departmentId = document.getElementById('ex-dept').value;
+  const fileInput = document.getElementById('ex-file');
+  if(!departmentId){ err.textContent='الرجاء اختيار القسم/التخصص'; err.classList.add('show'); return; }
+  if(!fileInput.files[0]){ err.textContent='الرجاء اختيار الملف'; err.classList.add('show'); return; }
+  let rows;
+  try{ rows = await readSpreadsheetRows(fileInput.files[0]); }
+  catch(e){ err.textContent='تعذّر قراءة الملف — تأكد أنه Excel أو CSV صحيح'; err.classList.add('show'); return; }
+  if(!rows.length){ err.textContent='الملف فارغ'; err.classList.add('show'); return; }
+  const idKey = findColumnKey(rows[0], ['الرقمالجامعي','رقمجامعي','الاستمارة','رقمالاستمارة','رقمالطالب','id']);
+  const regNoKey = findColumnKey(rows[0], ['رقمالتسجيل','رقمالقيد','regno','رقمتسجيل']);
+  const nameKey = findColumnKey(rows[0], ['الاسم','اسمالطالب','name']);
+  const levelKey = findColumnKey(rows[0], ['الفصلالدراسيالحالي','الفصلالدراسي','الفصل','المستوى','level']);
+  const specKey = findColumnKey(rows[0], ['التخصص','specialization']);
+  const batchKey = findColumnKey(rows[0], ['الدفعة','batch']);
+  const resultKey = findColumnKey(rows[0], ['النتيجة','result']);
+  if(!idKey || !regNoKey || !nameKey || !levelKey){
+    err.textContent='تعذّر التعرّف على أحد الأعمدة المطلوبة (الرقم الجامعي، رقم التسجيل، الاسم، الفصل الدراسي الحالي) — تحقق من عناوين الأعمدة';
+    err.classList.add('show'); return;
+  }
+  const created=[], skipped=[];
+  for(const row of rows){
+    const studentId = String(row[idKey]||'').trim();
+    const regNo = String(row[regNoKey]||'').trim();
+    const name = String(row[nameKey]||'').trim();
+    const currentLevel = String(row[levelKey]||'').trim();
+    const specialization = specKey ? String(row[specKey]||'').trim() : '';
+    const batch = batchKey ? String(row[batchKey]||'').trim() : '';
+    const resultStatusRaw = resultKey ? String(row[resultKey]||'').trim() : '';
+    if(!studentId || !regNo || !name || !currentLevel){ skipped.push({studentId, name, reason:'صف ناقص البيانات المطلوبة'}); continue; }
+    try{
+      const {row:srow, tempPw} = await createExistingStudentRecord({studentId, regNo, name, college, departmentId, specialization, batch, currentLevel, resultStatusRaw});
+      created.push({id:srow.id, name:srow.name, regNo:srow.regNo, tempPw});
+    }catch(e){ skipped.push({studentId, name, reason:e.message||'خطأ غير معروف'}); }
+  }
+  lastAdmissionCollege = college;
+  await addLog('استيراد مجموعة طلاب حاليين', `${created.length} طالب تم استيرادهم، ${skipped.length} تم تخطّيهم`);
+  window.__lastBulkAdmissionResult = {created, skipped};
+  closeModal();
+  openModal('نتيجة استيراد الطلاب', `
+    <div class="hint-box good-box">تم استيراد ${created.length} طالبًا بنجاح.</div>
+    ${skipped.length? `<div class="hint-box warn-box">تم تخطّي ${skipped.length} صف: ${skipped.map(s=>escapeHtml(s.studentId||'—')+' ('+escapeHtml(s.reason)+')').join('، ')}</div>`:''}
+  `, `
+    ${created.length? `<button class="btn btn-outline" onclick="downloadBulkAdmissionCredentials()">تنزيل بيانات الدخول (CSV)</button>`:''}
+    <button class="btn btn-gold" onclick="closeModal(); navigate('students');">حسنًا</button>
+  `);
+}
+
 /* ==================== الطلاب (لوحة الموظفين) ==================== */
+function studentsFilterNav(overrides){
+  const val = (id)=> document.getElementById(id) ? document.getElementById(id).value : '';
+  const params = {
+    q: val('studentsSearch'), college: val('filterCollege'), dept: val('filterDept'),
+    spec: val('filterSpec'), level: val('filterLevel'), ...(overrides||{}),
+  };
+  navigate('students', params);
+}
 async function renderStudents(){
   const scope = myCollegeScope();
   const q = (viewParams.q||'').trim().toLowerCase();
   const collegeFilter = viewParams.college || scope || '';
+  const deptFilter = viewParams.dept || '';
+  const specFilter = (viewParams.spec||'').trim().toLowerCase();
+  const levelFilter = viewParams.level || '';
   let list = (await dbGetAll('students')).filter(s=>!s.deleted);
   if(scope) list = list.filter(s=>s.college===scope);
   else if(collegeFilter) list = list.filter(s=>s.college===collegeFilter);
+  if(deptFilter) list = list.filter(s=>s.departmentId===deptFilter);
+  if(specFilter) list = list.filter(s=> (s.specialization||'').toLowerCase().includes(specFilter));
+  if(levelFilter) list = list.filter(s=> String(s.currentLevel||1)===String(levelFilter));
   if(q) list = list.filter(s=> s.name.toLowerCase().includes(q) || s.id.includes(q) || (s.regNo||'').includes(q));
   list.sort((a,b)=> a.name.localeCompare(b.name,'ar'));
+  const deptOptionsForFilter = await departmentOptionsForCollege(collegeFilter||scope||'');
   document.getElementById('viewport').innerHTML = `
     <div class="card">
       <h2>الطلاب${scope?' — '+escapeHtml(collegeLabel(scope)):''} <span class="eyebrow">${list.length}</span>
-        ${perm('canManageAdmissions')? `<button class="btn btn-gold btn-sm" onclick="openManualAdmissionModal()">+ إضافة طالب</button>`:''}
+        ${perm('canManageAdmissions')? `<button class="btn btn-gold btn-sm" onclick="openManualAdmissionModal()">+ إضافة طالب</button> <button class="btn btn-outline btn-sm" onclick="openBulkExistingStudentsModal()">+ إضافة مجموعة طلاب (طلاب حاليون)</button>`:''}
       </h2>
       <div class="row" style="margin-bottom:14px;">
-        <div class="field"><label>بحث بالاسم أو الرقم الجامعي أو رقم التسجيل</label><input id="studentsSearch" value="${escapeHtml(viewParams.q||'')}" oninput="navigate('students',{q:this.value,college:document.getElementById('filterCollege')?document.getElementById('filterCollege').value:''})"></div>
-        ${!scope? `<div class="field"><label>الكلية</label><select id="filterCollege" onchange="navigate('students',{q:document.getElementById('studentsSearch').value,college:this.value})"><option value="">— كل الكليات —</option>${COLLEGES.map(c=>`<option value="${c.key}" ${collegeFilter===c.key?'selected':''}>${c.label}</option>`).join('')}</select></div>`:''}
+        <div class="field"><label>بحث بالاسم أو الرقم الجامعي أو رقم التسجيل</label><input id="studentsSearch" value="${escapeHtml(viewParams.q||'')}" oninput="studentsFilterNav()"></div>
+        ${!scope? `<div class="field"><label>الكلية</label><select id="filterCollege" onchange="studentsFilterNav({dept:''})"><option value="">— كل الكليات —</option>${COLLEGES.map(c=>`<option value="${c.key}" ${collegeFilter===c.key?'selected':''}>${c.label}</option>`).join('')}</select></div>`:''}
+        <div class="field"><label>القسم</label><select id="filterDept" onchange="studentsFilterNav()"><option value="">— كل الأقسام —</option>${deptOptionsForFilter.map(d=>`<option value="${d.id}" ${deptFilter===d.id?'selected':''}>${escapeHtml(d.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>التخصص</label><input id="filterSpec" value="${escapeHtml(viewParams.spec||'')}" placeholder="نص حر" oninput="studentsFilterNav()"></div>
+        <div class="field"><label>الفصل الدراسي</label><select id="filterLevel" onchange="studentsFilterNav()"><option value="">— كل الفصول —</option>${Array.from({length:12},(_,i)=>i+1).map(n=>`<option value="${n}" ${String(levelFilter)===String(n)?'selected':''}>الفصل ${n}</option>`).join('')}</select></div>
       </div>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>الرقم الجامعي</th><th>رقم التسجيل</th><th>الاسم</th><th>الكلية</th><th>القسم/التخصص</th><th class="fit"></th></tr></thead>
+        <thead><tr><th>الرقم الجامعي</th><th>رقم التسجيل</th><th>الاسم</th><th>الكلية</th><th>القسم/التخصص</th><th>الفصل الحالي</th><th class="fit"></th></tr></thead>
         <tbody>
           ${list.map(s=>`
             <tr>
@@ -1456,9 +1938,10 @@ async function renderStudents(){
               <td><b>${escapeHtml(s.regNo||'—')}</b></td>
               <td>${escapeHtml(s.name)}</td>
               <td>${escapeHtml(collegeLabel(s.college))}</td>
-              <td>${escapeHtml(s.department||'—')}</td>
+              <td>${escapeHtml(s.department||'—')}${s.specialization && s.specialization!==s.department ? ' / '+escapeHtml(s.specialization):''}</td>
+              <td>${escapeHtml(String(s.currentLevel||1))}</td>
               <td class="fit"><button class="btn btn-outline btn-sm" onclick="navigate('studentDetail',{id:'${s.id}'})">تفاصيل</button></td>
-            </tr>`).join('') || `<tr><td colspan="6" class="muted" style="text-align:center;padding:20px;">لا يوجد طلاب مطابقون</td></tr>`}
+            </tr>`).join('') || `<tr><td colspan="7" class="muted" style="text-align:center;padding:20px;">لا يوجد طلاب مطابقون</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -1473,7 +1956,7 @@ async function renderStudentDetail(){
   const scope = myCollegeScope();
   if(scope && student.college!==scope){ vp.innerHTML = `<div class="card empty-state"><div class="icon">🔒</div><h3>لا تملك صلاحية الوصول لهذا الطالب</h3></div>`; return; }
   const courses = await dbGetAll('courses');
-  const regs = (await dbGetAllByIndex('registrations','studentId', id)).filter(r=>r.status==='registered'||r.status==='pending');
+  const regs = (await dbGetAllByIndex('registrations','studentId', id)).filter(r=>r.status==='registered'||r.status==='pending'||r.status==='waitlisted');
   const semesters = await dbGetAll('semesters');
   const offerings = await dbGetAll('offerings');
   const canEdit = perm('canManageStudents');
@@ -1487,7 +1970,7 @@ async function renderStudentDetail(){
         <div><div class="muted">الكلية</div><div><b>${escapeHtml(collegeLabel(student.college))}</b></div></div>
         <div><div class="muted">القسم/التخصص</div><div><b>${escapeHtml(student.department||'—')}</b></div></div>
         <div><div class="muted">الدفعة (سنة القبول)</div><div><b>${escapeHtml(student.batch||'—')}</b></div></div>
-        <div><div class="muted">المستوى الدراسي الحالي</div><div><b>المستوى ${escapeHtml(String(student.currentLevel||1))}</b></div></div>
+        <div><div class="muted">الفصل الدراسي الحالي</div><div><b>الفصل الدراسي ${escapeHtml(String(student.currentLevel||1))}</b></div></div>
         <div><div class="muted">المدرسة الثانوية</div><div>${escapeHtml(student.secondarySchool||'—')}</div></div>
         <div><div class="muted">الهاتف</div><div>${escapeHtml(student.phone||'—')}</div></div>
       </div>
@@ -1533,7 +2016,7 @@ async function renderStudentDetail(){
             <td>${escapeHtml(sem?sem.name:'—')}</td>
             <td>${escapeHtml(course?course.name:'—')}</td>
             <td>${escapeHtml(String(r.creditHours))}</td>
-            <td><span class="pill ${r.status==='registered'?'pill-good':'pill-gold'}">${r.status==='registered'?'معتمد':'قيد المراجعة'}</span></td>
+            <td><span class="pill ${r.status==='registered'?'pill-good':(r.status==='waitlisted'?'pill-mid':'pill-gold')}">${r.status==='registered'?'معتمد':(r.status==='waitlisted'?'قائمة انتظار':'قيد المراجعة')}</span></td>
             <td>${fmtDate(r.registeredAt)}</td>
           </tr>`;
         }).join('') || `<tr><td colspan="5" class="muted" style="text-align:center;padding:20px;">لا يوجد سجل تسجيل بعد</td></tr>`}
@@ -1642,13 +2125,44 @@ async function submitLiftFlag(studentId, flagId){
   closeModal(); toast('تم فك التجميد'); navigate('studentDetail',{id:studentId});
 }
 
+// يستدعي Edge Function اختيارية (admin-reset-password) لمزامنة كلمة مرور
+// الطالب السحابية بأمان — service_role لا يمكن استخدامه مباشرة من المتصفح،
+// فتُنفَّذ العملية على خادم Supabase نفسه. إن لم تُنشر هذه الدالة على مشروع
+// المستخدم بعد، تفشل المحاولة بأمان دون أي تأثير على التحديث المحلي.
+async function syncCloudPasswordViaEdgeFunction(studentId, newPassword){
+  try{
+    const url = await getSetting('supabaseUrl'); const key = await getSetting('supabaseAnonKey');
+    if(!url || !key || typeof navigator==='undefined' || !navigator.onLine) return {ok:false, reason:'offline_or_unconfigured'};
+    const client = await ensureSupabaseClient();
+    if(!client) return {ok:false, reason:'offline_or_unconfigured'};
+    const { data: sessionData } = await client.auth.getSession();
+    const accessToken = sessionData && sessionData.session ? sessionData.session.access_token : null;
+    if(!accessToken) return {ok:false, reason:'no_session'};
+    const resp = await withTimeout(fetch(`${url.replace(/\/$/,'')}/functions/v1/admin-reset-password`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${accessToken}`, 'apikey': key },
+      body: JSON.stringify({studentId, newPassword}),
+    }), 10000, 'SUPABASE_TIMEOUT');
+    const result = await resp.json().catch(()=>({}));
+    if(!resp.ok) return {ok:false, reason: result.error || 'server_error'};
+    return {ok:true};
+  }catch(e){ return {ok:false, reason:'network_error'}; }
+}
+function cloudPasswordSyncReasonLabel(reason){
+  const known = {offline_or_unconfigured:'غير متصل بالإنترنت أو المزامنة السحابية غير مُهيَّأة', no_session:'لا توجد جلسة دخول سحابية نشطة لحسابك الحالي — سجّل خروجك ثم ادخل من جديد', network_error:'تعذّر الاتصال بالخادم'};
+  return known[reason] || `الدالة (admin-reset-password) غير منشورة بعد على مشروعك، أو حدث خطأ: ${reason}`;
+}
 async function confirmResetStudentPassword(id){
   const tempPw = genTempPassword();
   await setStudentPassword(id, tempPw);
   await addLog('إعادة تعيين كلمة مرور طالب', id);
-  const cloudNote = supabaseClient
-    ? `<div class="hint-box mid-box" style="margin-top:10px;">إن كانت المزامنة السحابية مفعّلة: كلمة المرور هذه تعمل فورًا على أي جهاز يزامن بياناته (دخول محلي)، لكن قد لا تُقبل عبر "الدخول السحابي المباشر" حتى يغيّرها الطالب بنفسه لاحقًا من صفحة "بياناتي" وهو متصل بالإنترنت.</div>`
-    : '';
+  let cloudNote = '';
+  if(supabaseClient){
+    const cloudResult = await syncCloudPasswordViaEdgeFunction(id, tempPw);
+    cloudNote = cloudResult.ok
+      ? `<div class="hint-box good-box" style="margin-top:10px;">✅ تمت أيضًا مزامنة كلمة المرور هذه مباشرةً مع حساب الطالب السحابي (Supabase Auth) عبر Edge Function.</div>`
+      : `<div class="hint-box mid-box" style="margin-top:10px;">كلمة المرور هذه تعمل فورًا محليًا (وتُزامَن عبر جدول الطلاب كسائر البيانات)، لكن تعذّرت مزامنتها المباشرة مع حساب Supabase Auth السحابي للطالب: ${escapeHtml(cloudPasswordSyncReasonLabel(cloudResult.reason))}. ستُحل تلقائيًا حين يغيّر الطالب كلمة مروره بنفسه لاحقًا وهو متصل بالإنترنت — أو انشر ملف supabase-edge-function-reset-password.ts المرفق مع النظام لتفعيل المزامنة الفورية.</div>`;
+  }
   openModal('تم إنشاء كلمة مرور جديدة', `<div class="hint-box good-box">كلمة المرور المؤقتة الجديدة: <b style="font-size:18px;">${escapeHtml(tempPw)}</b></div>${cloudNote}`,
     `<button class="btn btn-gold" onclick="closeModal(); navigate('studentDetail',{id:'${id}'});">حسنًا</button>`);
 }
@@ -1698,11 +2212,11 @@ async function renderCourses(){
   document.getElementById('viewport').innerHTML = `
     <div class="card">
       <h2>دليل المقررات${scope?' — '+escapeHtml(collegeLabel(scope)):''} <span class="eyebrow">${list.length}</span>
-        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openAddCourseModal()">+ مقرر جديد</button>`:''}
+        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openAddCourseModal()">+ مقرر جديد</button> <button class="btn btn-outline btn-sm" onclick="openBulkCoursesModal()">📥 استيراد جماعي (Excel)</button>`:''}
       </h2>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>الرمز</th><th>اسم المقرر</th><th>الكلية</th><th>الساعات المعتمدة</th><th>المستوى</th><th>المتطلب السابق</th><th class="fit"></th></tr></thead>
+        <thead><tr><th>الرمز</th><th>اسم المقرر</th><th>الكلية</th><th>الساعات المعتمدة</th><th>الفصل الدراسي</th><th>المتطلب السابق</th><th class="fit"></th></tr></thead>
         <tbody>
         ${list.map(c=>`
           <tr>
@@ -1734,7 +2248,7 @@ async function openAddCourseModal(editId){
     ${!scope? `<div class="field"><label for="cs-college">الكلية</label><select id="cs-college" onchange="refreshCoursePrereqOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
     <div class="row2">
       <div class="field"><label for="cs-hours">الساعات المعتمدة</label><input id="cs-hours" type="number" min="1" max="6" value="${editing?editing.creditHours:3}"></div>
-      <div class="field"><label for="cs-level">المستوى الدراسي (اختياري)</label><input id="cs-level" value="${editing?escapeHtml(editing.level||''):''}" placeholder="مثال: 1"></div>
+      <div class="field"><label for="cs-level">الفصل الدراسي (اختياري)</label><input id="cs-level" value="${editing?escapeHtml(editing.level||''):''}" placeholder="مثال: 1"></div>
     </div>
     <div class="field"><label>المتطلبات السابقة (اختياري)</label>
       <div id="cs-prereq-box" style="max-height:160px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;">
@@ -1784,6 +2298,55 @@ async function deleteCourse(id){
   await addLog('حذف مقرر', id);
   toast('تم الحذف'); navigate('courses');
 }
+function openBulkCoursesModal(){
+  const scope = myCollegeScope();
+  openModal('استيراد مقررات جماعيًا', `
+    <p class="muted" style="line-height:1.9;">أعمدة الملف المطلوبة: «رمز المقرر»، «اسم المقرر». أعمدة اختيارية: «الساعات المعتمدة» (افتراضي 3)، «الفصل الدراسي» (المستوى)${scope?'':'، «الكلية»'}. لا يدعم الاستيراد الجماعي تحديد المتطلبات السابقة — يمكن إضافتها لاحقًا يدويًا من تبويب المقررات.</p>
+    <div class="field"><label for="csb-file">ملف المقررات (Excel أو CSV)</label><input type="file" id="csb-file" accept=".xlsx,.xls,.csv"></div>
+    <div class="err-text" id="csb-err"></div>
+  `, `
+    <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+    <button class="btn btn-gold" onclick="submitBulkCourses()">استيراد</button>
+  `);
+}
+async function submitBulkCourses(){
+  const scope = myCollegeScope();
+  const err = document.getElementById('csb-err'); err.classList.remove('show');
+  const fileInput = document.getElementById('csb-file');
+  if(!fileInput.files[0]){ err.textContent='الرجاء اختيار الملف'; err.classList.add('show'); return; }
+  let rows;
+  try{ rows = await readSpreadsheetRows(fileInput.files[0]); }
+  catch(e){ err.textContent='تعذّر قراءة الملف — تأكد أنه Excel أو CSV صحيح'; err.classList.add('show'); return; }
+  if(!rows.length){ err.textContent='الملف فارغ'; err.classList.add('show'); return; }
+  const codeKey = findColumnKey(rows[0], ['رمزالمقرر','الرمز','code']);
+  const nameKey = findColumnKey(rows[0], ['اسمالمقرر','الاسم','name']);
+  const hoursKey = findColumnKey(rows[0], ['الساعاتالمعتمدة','الساعات','hours']);
+  const levelKey = findColumnKey(rows[0], ['الفصلالدراسي','المستوى','الفصل','level']);
+  const collegeKey = findColumnKey(rows[0], ['الكلية','college']);
+  if(!codeKey || !nameKey){ err.textContent='تعذّر التعرّف على عمودي «رمز المقرر» و«اسم المقرر» — تحقق من عناوين الأعمدة'; err.classList.add('show'); return; }
+  const created=[], skipped=[];
+  for(const row of rows){
+    const code = String(row[codeKey]||'').trim();
+    const name = String(row[nameKey]||'').trim();
+    const college = scope || (collegeKey ? matchCollegeFromText(row[collegeKey]) : null);
+    const hours = hoursKey ? (parseInt(String(row[hoursKey]||'').trim(),10)||3) : 3;
+    const level = levelKey ? String(row[levelKey]||'').trim() : '';
+    if(!code || !name){ skipped.push({name, code, reason:'صف بدون رمز أو اسم'}); continue; }
+    if(!college){ skipped.push({name, code, reason:'تعذّر تحديد الكلية'}); continue; }
+    try{
+      const existing = await dbGet('courses', code);
+      if(existing) throw new Error('رمز المقرر مستخدم مسبقًا');
+      await dbPut('courses', {id:code, code, name, college, creditHours:hours, level: level||null, prerequisites:[]});
+      created.push({name, code, college});
+    }catch(e){ skipped.push({name, code, reason:e.message||'خطأ غير معروف'}); }
+  }
+  await addLog('استيراد مقررات جماعي', `${created.length} مقرر تم إضافتهم، ${skipped.length} تم تخطّيهم`);
+  closeModal();
+  openModal('نتيجة استيراد المقررات', `
+    <div class="hint-box good-box">تم إضافة ${created.length} مقررًا بنجاح.</div>
+    ${skipped.length? `<div class="hint-box warn-box">تم تخطّي ${skipped.length} صف: ${skipped.map(s=>escapeHtml((s.name||s.code||'—'))+' ('+escapeHtml(s.reason)+')').join('، ')}</div>`:''}
+  `, `<button class="btn btn-gold" onclick="closeModal(); navigate('courses');">حسنًا</button>`);
+}
 
 /* ==================== المناهج الدراسية (مقررات ثابتة لكل مستوى/قسم) ====================
    بدل أن يختار الطالب مقرراته وساعاته بحرية، يحدّد الموظف هنا قائمة المقررات
@@ -1812,15 +2375,15 @@ async function renderCurricula(){
     ${dept? `
     <div class="card">
       <h2>مستويات «${escapeHtml(dept.name)}» <span class="eyebrow">${allCurricula.length}</span>
-        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ مستوى جديد</button>`:''}
+        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ فصل دراسي جديد</button>`:''}
       </h2>
       ${allCurricula.map(cur=>{
         const list = (cur.courseIds||[]).map(cid=> courses.find(c=>c.id===cid)).filter(Boolean);
         const totalHours = list.reduce((s,c)=>s+(c.creditHours||0),0);
         return `<div class="offering-card">
           <div class="offering-main">
-            <div class="cname">المستوى ${escapeHtml(String(cur.level))} <span class="muted">(${list.length} مقررًا — ${totalHours} ساعة)</span></div>
-            <div class="cmeta">${list.map(c=>escapeHtml(c.code+' — '+c.name)).join('، ') || 'لا توجد مقررات محدَّدة بعد لهذا المستوى'}</div>
+            <div class="cname">الفصل الدراسي ${escapeHtml(String(cur.level))} <span class="muted">(${list.length} مقررًا — ${totalHours} ساعة)</span></div>
+            <div class="cmeta">${list.map(c=>escapeHtml(c.code+' — '+c.name)).join('، ') || 'لا توجد مقررات محدَّدة بعد لهذا الفصل الدراسي'}</div>
           </div>
           ${perm('canManageCatalog')? `<div class="row"><button class="icon-btn" onclick="openCurriculumLevelModal('${deptId}',${cur.level})" title="تعديل">✏️</button></div>`:''}
         </div>`;
@@ -1835,12 +2398,13 @@ function openCurriculumLevelModal(departmentId, existingLevel){
     (editId ? dbGet('curricula', editId) : Promise.resolve(null)).then(editing=>{
       const selected = new Set((editing&&editing.courseIds)||[]);
       window.__curCourses = courses;
-      openModal(editing?`تعديل مقررات المستوى ${existingLevel}`:'إضافة مستوى دراسي جديد', `
-        <div class="field"><label for="cu-level">رقم المستوى الدراسي</label><input id="cu-level" type="number" min="1" max="12" value="${editing?editing.level:''}" ${editing?'disabled':''}></div>
-        <div class="field"><label>مقررات هذا المستوى (ثابتة لجميع طلاب القسم فيه)</label>
+      openModal(editing?`تعديل مقررات الفصل الدراسي ${existingLevel}`:'إضافة فصل دراسي جديد للمنهج', `
+        <div class="field"><label for="cu-level">رقم الفصل الدراسي</label><input id="cu-level" type="number" min="1" max="12" value="${editing?editing.level:''}" ${editing?'disabled':''}></div>
+        <div class="field"><label>مقررات هذا الفصل الدراسي (ثابتة لجميع طلاب القسم فيه)</label>
           <div style="max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;">
-            ${courses.map(c=>`<div class="checkrow" style="padding:4px 0;"><input type="checkbox" id="cu-${c.id}" ${selected.has(c.id)?'checked':''}><label for="cu-${c.id}">${escapeHtml(c.code)} — ${escapeHtml(c.name)} (${c.creditHours} س)</label></div>`).join('') || '<div class="muted">لا توجد مقررات في دليل كلية هذا القسم بعد — أضفها أولًا من «دليل المقررات».</div>'}
+            ${courses.map(c=>`<div class="checkrow" style="padding:4px 0;"><input type="checkbox" id="cu-${c.id}" ${selected.has(c.id)?'checked':''}><label for="cu-${c.id}">${escapeHtml(c.code)} — ${escapeHtml(c.name)} (${c.creditHours} س)${c.level? ` <span class="muted" style="font-size:11px;">— مستوى الدليل: ${escapeHtml(String(c.level))}</span>`:''}</label></div>`).join('') || '<div class="muted">لا توجد مقررات في دليل كلية هذا القسم بعد — أضفها أولًا من «دليل المقررات».</div>'}
           </div>
+          <div class="muted" style="font-size:11.5px;margin-top:6px;">حقل «الفصل الدراسي» في دليل المقررات (إن وُجد) معلوماتي فقط لمساعدتك على الاختيار هنا — الفعلي والمُلزِم للطالب هو تجميع المقررات ضمن هذا الفصل الدراسي، بصرف النظر عن قيمة ذلك الحقل.</div>
         </div>
         <div class="err-text" id="cu-err"></div>
       `, `
@@ -1853,12 +2417,12 @@ function openCurriculumLevelModal(departmentId, existingLevel){
 async function submitCurriculumLevel(departmentId){
   const level = parseInt(document.getElementById('cu-level').value,10);
   const err = document.getElementById('cu-err'); err.classList.remove('show');
-  if(!level || level<1){ err.textContent='الرجاء إدخال رقم مستوى صحيح'; err.classList.add('show'); return; }
+  if(!level || level<1){ err.textContent='الرجاء إدخال رقم فصل دراسي صحيح'; err.classList.add('show'); return; }
   const courses = window.__curCourses||[];
   const courseIds = courses.filter(c=> document.getElementById('cu-'+c.id) && document.getElementById('cu-'+c.id).checked).map(c=>c.id);
   const id = departmentId+'__'+level;
   await dbPut('curricula', {id, departmentId, level, courseIds, updatedAt:new Date().toISOString()});
-  await addLog('حفظ منهج مستوى دراسي', `${departmentId} — المستوى ${level} (${courseIds.length} مقررًا)`);
+  await addLog('حفظ منهج فصل دراسي', `${departmentId} — الفصل الدراسي ${level} (${courseIds.length} مقررًا)`);
   closeModal(); toast('تم الحفظ'); navigate('curricula',{deptId:departmentId});
 }
 
@@ -1877,6 +2441,8 @@ async function renderSemesters(){
             <div class="cmeta">
               فترة التسجيل: ${fmtDate(s.regStart)} — ${fmtDate(s.regEnd)} ·
               <span class="pill ${s.regOpen?'pill-good':'pill-warn'}">${s.regOpen?'التسجيل مفتوح':'التسجيل مغلق'}</span>
+              ${(s.regFee||s.tuitionFee)? ` · رسوم التسجيل: ${fmtMoney(s.regFee)} · الرسوم الدراسية: ${fmtMoney(s.tuitionFee)} · الإجمالي: ${fmtMoney((Number(s.regFee)||0)+(Number(s.tuitionFee)||0))}`:''}
+              ${s.bankInfo? ` · جهة السداد: ${escapeHtml(s.bankInfo)}`:''}
             </div>
           </div>
           <div class="row">
@@ -1900,6 +2466,11 @@ function openAddSemesterModal(editId){
         <div class="field"><label for="sm-end">نهاية فترة التسجيل</label><input id="sm-end" type="date" value="${editing?editing.regEnd||'':''}"></div>
       </div>
       <div class="checkrow"><input type="checkbox" id="sm-open" ${editing&&editing.regOpen?'checked':(editing?'':'checked')}><label for="sm-open">التسجيل مفتوح للطلاب الآن</label></div>
+      <div class="row2">
+        <div class="field"><label for="sm-regfee">رسوم التسجيل (اختياري)</label><input id="sm-regfee" type="number" min="0" value="${editing&&editing.regFee!=null?editing.regFee:''}"></div>
+        <div class="field"><label for="sm-tuition">المصروفات الدراسية (اختياري)</label><input id="sm-tuition" type="number" min="0" value="${editing&&editing.tuitionFee!=null?editing.tuitionFee:''}"></div>
+      </div>
+      <div class="field"><label for="sm-bank">رقم الحساب البنكي / مكان تسديد الرسوم (اختياري)</label><input id="sm-bank" value="${editing?escapeHtml(editing.bankInfo||''):''}" placeholder="مثال: بنك الخرطوم — حساب رقم ... باسم جامعة زالنجي"></div>
       <div class="err-text" id="sm-err"></div>
     `, `
       <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
@@ -1916,6 +2487,11 @@ async function submitSemester(editId){
   row.regStart = document.getElementById('sm-start').value || null;
   row.regEnd = document.getElementById('sm-end').value || null;
   row.regOpen = document.getElementById('sm-open').checked;
+  const regFeeVal = document.getElementById('sm-regfee').value.trim();
+  const tuitionVal = document.getElementById('sm-tuition').value.trim();
+  row.regFee = regFeeVal ? Number(regFeeVal) : null;
+  row.tuitionFee = tuitionVal ? Number(tuitionVal) : null;
+  row.bankInfo = document.getElementById('sm-bank').value.trim() || null;
   await dbPut('semesters', row);
   await addLog(editId?'تعديل فصل دراسي':'إضافة فصل دراسي', name);
   closeModal(); toast('تم الحفظ'); navigate('semesters');
@@ -2018,6 +2594,7 @@ async function renderSemesterDetail(){
         const held = allRegs.filter(r=>r.offeringId===o.id && (r.status==='registered'||r.status==='pending'));
         const confirmed = held.filter(r=>r.status==='registered').length;
         const pending = held.filter(r=>r.status==='pending').length;
+        const waitlisted = allRegs.filter(r=>r.offeringId===o.id && r.status==='waitlisted').length;
         const full = held.length>=o.capacity;
         return `<div class="offering-card ${full?'disabled':''}">
           <div class="offering-main">
@@ -2030,7 +2607,7 @@ async function renderSemesterDetail(){
             </div>
           </div>
           <div style="min-width:170px;">
-            <div class="muted" style="margin-bottom:4px;">${held.length} / ${o.capacity} (معتمد: ${confirmed}، قيد المراجعة: ${pending})</div>
+            <div class="muted" style="margin-bottom:4px;">${held.length} / ${o.capacity} (معتمد: ${confirmed}، قيد المراجعة: ${pending})${waitlisted? ` · <span style="color:var(--mid);font-weight:700;">قائمة انتظار: ${waitlisted}</span>`:''}</div>
             <div class="bar-outer"><div class="bar-inner ${full?'full':''}" style="width:${Math.min(100,(held.length/(o.capacity||1))*100)}%"></div></div>
           </div>
           <div class="row">
@@ -2067,6 +2644,34 @@ async function openAddOfferingModal(semId, editId){
     <button class="btn btn-gold" onclick="submitOffering('${semId}', ${editId?`'${editId}'`:'null'})">حفظ</button>
   `);
 }
+// تعارض المواعيد بين مقررات نفس مستوى المنهج: بما أن كل مقررات المستوى إلزامية
+// لجميع طلابه (لا اختيار حر)، تعارض شُعبتين زمنيًا ضمن نفس المستوى يعني تعذّر
+// حضور الطالب لكليهما معًا. الفحص تنبيهي فقط (غير مانع) لأن مسؤولية بناء
+// المنهج والشُعب موكولة للموظف، كما هو موثَّق في نطاق النظام.
+async function findCurriculumScheduleConflicts(offering, excludeOfferingId){
+  if(!offering.days || !offering.days.length || !offering.startTime || !offering.endTime) return [];
+  const allCurricula = await dbGetAll('curricula');
+  const relevant = allCurricula.filter(cur=> (cur.courseIds||[]).includes(offering.courseId));
+  if(!relevant.length) return [];
+  const siblingCourseIds = new Set();
+  relevant.forEach(cur=> (cur.courseIds||[]).forEach(cid=>{ if(cid!==offering.courseId) siblingCourseIds.add(cid); }));
+  if(!siblingCourseIds.size) return [];
+  const semOfferings = (await dbGetAllByIndex('offerings','semesterId', offering.semesterId)).filter(o=> o.id!==excludeOfferingId && siblingCourseIds.has(o.courseId));
+  if(!semOfferings.length) return [];
+  const courses = await dbGetAll('courses');
+  const conflicts = [];
+  for(const o of semOfferings){
+    if(!o.days || !o.days.length || !o.startTime || !o.endTime) continue;
+    const sharedDays = (o.days||[]).filter(d=> offering.days.includes(d));
+    if(!sharedDays.length) continue;
+    const overlap = (offering.startTime < o.endTime) && (o.startTime < offering.endTime);
+    if(overlap){
+      const c = courses.find(x=>x.id===o.courseId);
+      conflicts.push({course:c, days:sharedDays});
+    }
+  }
+  return conflicts;
+}
 async function submitOffering(semId, editId){
   const courseId = document.getElementById('of-course').value;
   const err = document.getElementById('of-err'); err.classList.remove('show');
@@ -2082,13 +2687,20 @@ async function submitOffering(semId, editId){
   const row = editId ? await dbGet('offerings', editId) : {id:uid(), semesterId:semId, createdAt:new Date().toISOString()};
   row.courseId = courseId; row.college = course.college; row.instructor = instructor||null;
   row.days = days; row.startTime = startTime||null; row.endTime = endTime||null; row.room = room||null; row.capacity = capacity;
+  const conflicts = await findCurriculumScheduleConflicts(row, editId);
   await dbPut('offerings', row);
   await addLog(editId?'تعديل شعبة':'إضافة شعبة', `${course.name}`);
-  closeModal(); toast('تم الحفظ'); navigate('semesterDetail',{id:semId});
+  closeModal();
+  if(conflicts.length){
+    toast(`⚠️ تم الحفظ، لكن تعارض بالمواعيد مع «${conflicts.map(c=>c.course?c.course.name:'').join('، ')}» ضمن نفس الفصل الدراسي بالمنهج — قد يتعذّر على الطالب حضور الشعبتين معًا`, true);
+  } else {
+    toast('تم الحفظ');
+  }
+  navigate('semesterDetail',{id:semId});
 }
 async function deleteOffering(id){
   const relatedRegs = (await dbGetAllByIndex('registrations','offeringId', id));
-  if(relatedRegs.some(r=>r.status==='registered'||r.status==='pending')){ toast('لا يمكن حذف الشعبة لوجود طلاب مسجّلين أو بانتظار المراجعة بها', true); return; }
+  if(relatedRegs.some(r=>r.status==='registered'||r.status==='pending'||r.status==='waitlisted')){ toast('لا يمكن حذف الشعبة لوجود طلاب مسجّلين أو بانتظار المراجعة أو بقائمة الانتظار بها', true); return; }
   const off = await dbGet('offerings', id);
   await dbDelete('offerings', id);
   await addLog('حذف شعبة', id);
@@ -2100,8 +2712,10 @@ async function openOfferingRoster(offeringId){
   const allRegs = (await dbGetAllByIndex('registrations','offeringId', offeringId));
   const confirmedRegs = allRegs.filter(r=>r.status==='registered');
   const pendingRegs = allRegs.filter(r=>r.status==='pending');
+  const waitlistRegs = allRegs.filter(r=>r.status==='waitlisted').sort((a,b)=> new Date(a.registeredAt)-new Date(b.registeredAt));
   const confirmedStudents = await Promise.all(confirmedRegs.map(r=>dbGet('students', r.studentId)));
   const pendingStudents = await Promise.all(pendingRegs.map(r=>dbGet('students', r.studentId)));
+  const waitlistStudents = await Promise.all(waitlistRegs.map(r=>dbGet('students', r.studentId)));
   openModal(`قائمة المسجلين — ${course.name}`, `
     <h3>معتمدون (${confirmedRegs.length})</h3>
     <div class="table-wrap">
@@ -2115,6 +2729,13 @@ async function openOfferingRoster(offeringId){
     <table>
       <thead><tr><th>الرقم الجامعي</th><th>الاسم</th></tr></thead>
       <tbody>${pendingStudents.filter(Boolean).map(s=>`<tr><td>${escapeHtml(s.id)}</td><td>${escapeHtml(s.name)}</td></tr>`).join('') || `<tr><td colspan="2" class="muted" style="text-align:center;">لا يوجد</td></tr>`}</tbody>
+    </table>
+    </div>
+    <h3 style="margin-top:16px;">قائمة الانتظار (${waitlistRegs.length}) <span class="muted" style="font-weight:400;font-size:12px;">— بترتيب الأقدمية</span></h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>الرقم الجامعي</th><th>الاسم</th></tr></thead>
+      <tbody>${waitlistStudents.filter(Boolean).map(s=>`<tr><td>${escapeHtml(s.id)}</td><td>${escapeHtml(s.name)}</td></tr>`).join('') || `<tr><td colspan="2" class="muted" style="text-align:center;">لا يوجد</td></tr>`}</tbody>
     </table>
     </div>
   `, `
@@ -2180,7 +2801,9 @@ async function renderRegistrationsMonitor(){
         return `<div class="offering-card">
           <div class="offering-main">
             <div class="cname">${escapeHtml(student.name||r.studentId)} — ${escapeHtml(student.id||'')}</div>
-            <div class="cmeta">عدد المقررات: ${r.offeringIds.length} · إجمالي الساعات: ${r.totalHours} · رقم الإيصال: ${escapeHtml(r.receiptNumber||'—')} · تاريخ الطلب: ${fmtDateTime(r.submittedAt)}</div>
+            <div class="cmeta">عدد المقررات: ${r.offeringIds.length} · إجمالي الساعات: ${r.totalHours} · رقم الإيصال: ${escapeHtml(r.receiptNumber||'—')} · تاريخ الطلب: ${fmtDateTime(r.submittedAt)}
+              ${r.totalDue>0? ` · المستحق: ${fmtMoney(r.totalDue)} · المدفوع: ${fmtMoney(r.amountPaid)}${r.remainingAmount>0?` · المتبقي: <b>${fmtMoney(r.remainingAmount)}</b> ⚠️`:''}`:''}
+            </div>
           </div>
           <div class="row">
             <button class="btn btn-outline btn-sm" onclick="openReviewRequestModal('${r.id}')">مراجعة واعتماد</button>
@@ -2212,6 +2835,19 @@ async function openReviewRequestModal(requestId){
       <div><div class="muted">الرقم الجامعي</div><div><b>${escapeHtml(student.id)}</b></div></div>
       <div><div class="muted">رقم الإيصال</div><div><b>${escapeHtml(req.receiptNumber||'—')}</b></div></div>
     </div>
+    ${req.totalDue>0? `
+    <div class="row2">
+      <div><div class="muted">إجمالي المستحق</div><div><b>${fmtMoney(req.totalDue)}</b></div></div>
+      <div><div class="muted">المدفوع حتى الآن</div><div><b>${fmtMoney(req.amountPaid)}</b></div></div>
+    </div>
+    ${req.remainingAmount>0? `<div class="hint-box warn-box">دفعة جزئية (حالة خاصة)${req.partialReason?': '+escapeHtml(req.partialReason):''} — المتبقي: <b>${fmtMoney(req.remainingAmount)}</b>
+      <div class="row2" style="margin-top:8px;">
+        <div class="field"><label for="rr-topup-amount">تسجيل دفعة إضافية (مبلغ)</label><input id="rr-topup-amount" type="number" min="1" max="${req.remainingAmount}"></div>
+        <div class="field"><label for="rr-topup-note">ملاحظة/رقم إيصال الدفعة الإضافية (اختياري)</label><input id="rr-topup-note"></div>
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="recordAdditionalPayment('${requestId}')">تسجيل الدفعة</button>
+    </div>` : ''}
+    ` : ''}
     <div class="field"><label>المقررات المطلوب تسجيلها</label>
       <div class="table-wrap"><table><thead><tr><th>المقرر</th><th>الساعات</th></tr></thead><tbody>
         ${offerings.filter(Boolean).map(o=>{ const c=courses.find(x=>x.id===o.courseId); return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${c?c.creditHours:''}</td></tr>`; }).join('')}
@@ -2226,6 +2862,48 @@ async function openReviewRequestModal(requestId){
     <button class="btn btn-gold" onclick="reviewRequest('${requestId}','approved')">اعتماد</button>
   `);
 }
+/* ==================== قائمة الانتظار عند امتلاء الشُعب ==================== */
+// عند تحرّر مقعد في شعبة (رفض طلب أو إلغاؤه)، يُرقّى أقدم طلب بقائمة الانتظار
+// لتلك الشعبة تلقائيًا: إلى "معتمد" مباشرة إن كان طلب التسجيل الأصلي معتمدًا
+// بالفعل، أو إلى "قيد المراجعة المالية" ليتبع نفس دورة الاعتماد المعتادة.
+async function promoteWaitlistForOfferings(offeringIds){
+  for(const offeringId of (offeringIds||[])){
+    const off = await dbGet('offerings', offeringId);
+    if(!off) continue;
+    const offRegs = await dbGetAllByIndex('registrations','offeringId', offeringId);
+    const held = offRegs.filter(r=>r.status==='registered'||r.status==='pending').length;
+    if(held>=off.capacity) continue;
+    const waiting = offRegs.filter(r=>r.status==='waitlisted').sort((a,b)=> new Date(a.registeredAt)-new Date(b.registeredAt));
+    if(!waiting.length) continue;
+    const promote = waiting[0];
+    let newStatus = 'pending';
+    if(promote.requestId){
+      const req = await dbGet('registrationRequests', promote.requestId);
+      if(req && req.status==='approved') newStatus = 'registered';
+    }
+    promote.status = newStatus;
+    await dbPut('registrations', promote);
+    await addLog('ترقية من قائمة الانتظار', `${promote.studentId} → ${offeringId} (${newStatus==='registered'?'معتمد':'قيد المراجعة'})`);
+  }
+}
+async function recordAdditionalPayment(requestId){
+  const req = await dbGet('registrationRequests', requestId);
+  if(!req) return;
+  const amountEl = document.getElementById('rr-topup-amount');
+  const noteEl = document.getElementById('rr-topup-note');
+  const amount = Number(amountEl.value)||0;
+  const remaining = req.remainingAmount||0;
+  if(amount<=0 || amount>remaining){ toast('المبلغ غير صالح — يجب ألا يتجاوز المبلغ المتبقي', true); return; }
+  req.amountPaid = (Number(req.amountPaid)||0) + amount;
+  req.remainingAmount = Math.max(0, (Number(req.totalDue)||0) - req.amountPaid);
+  req.paymentHistory = req.paymentHistory || [];
+  req.paymentHistory.push({amount, note: noteEl.value.trim()||null, recordedBy: currentUser.username, recordedAt: new Date().toISOString()});
+  await dbPut('registrationRequests', req);
+  await addLog('تسجيل دفعة إضافية', `${req.studentId} — ${req.id} — ${amount}`);
+  toast('تم تسجيل الدفعة');
+  closeModal();
+  navigate('registrations',{semId:req.semesterId});
+}
 async function reviewRequest(requestId, decision){
   const req = await dbGet('registrationRequests', requestId);
   const note = document.getElementById('rr-note') ? document.getElementById('rr-note').value.trim() : '';
@@ -2233,9 +2911,11 @@ async function reviewRequest(requestId, decision){
   await dbPut('registrationRequests', req);
   const regs = await dbGetAllByIndex('registrations','requestId', requestId);
   for(const r of regs){
-    r.status = decision==='approved' ? 'registered' : 'rejected';
+    if(decision==='approved'){ if(r.status==='pending') r.status='registered'; /* صفوف قائمة الانتظار تبقى كما هي حتى يتوفر مقعد فعلي */ }
+    else { r.status = 'rejected'; }
     await dbPut('registrations', r);
   }
+  if(decision==='rejected'){ await promoteWaitlistForOfferings(req.offeringIds); }
   await addLog(decision==='approved'?'اعتماد طلب تسجيل':'رفض طلب تسجيل', `${req.studentId} — ${req.id}`);
   closeModal(); toast(decision==='approved'?'تم اعتماد التسجيل':'تم رفض الطلب'); navigate('registrations',{semId:req.semesterId});
 }
@@ -2247,9 +2927,18 @@ async function renderReports(){
   const byCollege = {};
   students.forEach(s=>{ byCollege[s.college] = (byCollege[s.college]||0)+1; });
   const maxCollegeCount = Math.max(1, ...Object.values(byCollege));
+  const byLevel = {};
+  students.forEach(s=>{ const lvl = s.currentLevel||1; byLevel[lvl] = (byLevel[lvl]||0)+1; });
+  const maxLevelCount = Math.max(1, ...Object.values(byLevel));
   const allRequests = (await dbGetAll('registrationRequests')).filter(r=>!scope || r.college===scope);
   const byStatus = {pending:0, approved:0, rejected:0};
   allRequests.forEach(r=> byStatus[r.status] = (byStatus[r.status]||0)+1);
+  const statusTotal = Math.max(1, byStatus.pending+byStatus.approved+byStatus.rejected);
+  const statusSegs = [
+    {key:'approved', label:'معتمد', n:byStatus.approved, color:'var(--good)'},
+    {key:'pending', label:'قيد المراجعة', n:byStatus.pending, color:'var(--mid)'},
+    {key:'rejected', label:'مرفوض', n:byStatus.rejected, color:'var(--warn)'},
+  ];
   document.getElementById('viewport').innerHTML = `
     <div class="row2">
       <div class="card">
@@ -2261,13 +2950,26 @@ async function renderReports(){
           </div>`).join('') || '<div class="muted">لا توجد بيانات</div>'}
       </div>
       <div class="card">
-        <h2>حالة طلبات التسجيل المالية</h2>
-        <div class="stat-grid" style="margin-bottom:0;">
-          <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.pending}</div><div class="l">قيد المراجعة</div></div>
-          <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.approved}</div><div class="l">معتمد</div></div>
-          <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.rejected}</div><div class="l">مرفوض</div></div>
-        </div>
+        <h2>توزيع الطلاب حسب الفصل الدراسي</h2>
+        ${Object.entries(byLevel).sort((a,b)=>Number(a[0])-Number(b[0])).map(([lvl,n])=>`
+          <div style="margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>الفصل الدراسي ${escapeHtml(lvl)}</span><span>${n}</span></div>
+            <div class="bar-outer"><div class="bar-inner" style="width:${(n/maxLevelCount)*100}%"></div></div>
+          </div>`).join('') || '<div class="muted">لا توجد بيانات</div>'}
       </div>
+    </div>
+    <div class="card">
+      <h2>حالة طلبات التسجيل المالية</h2>
+      <div class="stat-grid" style="margin-bottom:16px;">
+        <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.pending}</div><div class="l">قيد المراجعة</div></div>
+        <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.approved}</div><div class="l">معتمد</div></div>
+        <div class="stat-card" style="cursor:default;"><div class="n">${byStatus.rejected}</div><div class="l">مرفوض</div></div>
+      </div>
+      ${allRequests.length? `
+      <div class="stack-bar">${statusSegs.filter(s=>s.n>0).map(s=>`<div class="stack-seg" style="width:${(s.n/statusTotal)*100}%;background:${s.color};" title="${escapeHtml(s.label)}: ${s.n}"></div>`).join('')}</div>
+      <div class="row" style="margin-top:10px;gap:16px;">
+        ${statusSegs.map(s=>`<div style="display:flex;align-items:center;gap:6px;font-size:12.5px;"><span style="width:10px;height:10px;border-radius:3px;background:${s.color};display:inline-block;"></span>${escapeHtml(s.label)} (${s.n} — ${Math.round((s.n/statusTotal)*100)}%)</div>`).join('')}
+      </div>` : '<div class="muted">لا توجد طلبات تسجيل بعد</div>'}
     </div>
   `;
 }
@@ -2383,8 +3085,9 @@ async function renderSettings(){
         1) أنشئ مشروعًا مجانيًا على <b>supabase.com</b>، وانسخ Project URL وanon public key من Settings → API.<br>
         2) نفّذ ملف <b>supabase_schema.sql</b> المرفق مع هذا النظام من SQL Editor في Supabase (ينشئ الجداول وسياسات RLS وحاوية تخزين الإيصالات).<br>
         3) من Authentication → Providers → Email عطِّل "Confirm email" — وإلا لن تعمل حسابات الموظفين والطلاب الجديدة.<br>
-        4) بعد الحفظ هنا، سجّل خروجك من النظام وادخل من جديد لتفعيل المصادقة السحابية لحسابك.<br><br>
-        ⚠️ أي شخص يملك الرابط والمفتاح أعلاه يحتاج أيضًا حساب دخول صالحًا (موظف أو طالب) في هذا النظام كي تسمح له سياسات RLS بقراءة أو كتابة أي بيانات — لكن يُنصح رغم ذلك بعدم مشاركتهما علنًا.
+        4) بعد الحفظ هنا، سجّل خروجك من النظام وادخل من جديد لتفعيل المصادقة السحابية لحسابك.<br>
+        5) <b>(اختياري)</b> لتفعيل مزامنة فورية لكلمة مرور الطالب السحابية عند إعادة تعيينها من الموظف، انشر ملف <b>supabase-edge-function-reset-password.ts</b> المرفق كذلك (خطوات النشر داخل الملف نفسه) — بدونها يستمر النظام بالعمل بشكل طبيعي، وتُحل مزامنة كلمة المرور تلقائيًا فقط حين يغيّرها الطالب بنفسه.<br><br>
+        ⚠️ سياسات RLS في هذا المشروع تحدّ الوصول حسب كلية الموظف تلقائيًا (والمدير العام يرى كل الكليات)، والطالب لا يصل إلا لبياناته هو — لكن يُنصح رغم ذلك بعدم مشاركة الرابط والمفتاح أعلاه علنًا.
       </div>` : ''}
     </div>` : ''}
     <div class="card">
@@ -2444,9 +3147,18 @@ async function exportAcademicRecordCompatible(){
    يُمنع تسجيل الفصل القادم إن وُجد أيٌّ من الآتي:
      1) عائق مستقل فعّال على سجل الطالب (حالة غش / عائق مالي / ملحق لم يُرفَع
         بعد) — عوائق تُدار يدويًا ولا تُرفع إلا بإجراء "فك تجميد" من الموظف.
+        هذا الشرط يُفحص دائمًا بلا استثناء، بصرف النظر عن رقم الفصل القادم.
      2) نتيجة آخر فصل دراسي سجَّل به الطالب فعليًا (registered) غير معتمدة بعد،
-        أو رسوب. يُفحص فصل واحد فقط عادةً؛ فإن كانت نتيجة ذلك الفصل "ملحق"
-        يُفحص الفصل الذي قبله أيضًا (فصلان) تحسبًا لتعثّر متكرر لم يُحسم بعد. */
+        أو رسوب — لكن هذا الشرط لا يُفحص إلا عند التسجيل لفصل دراسي فردي
+        (الثالث، الخامس، السابع، التاسع، الحادي عشر...)، أي فقط حين تكون
+        نتيجة فصلين متتاليين قد استُكملت. الفصول الزوجية (الثاني، الرابع...)
+        لا تتطلب أي نتيجة معتمدة مسبقًا. يُفحص فصل واحد فقط عادةً؛ فإن كانت
+        نتيجة ذلك الفصل "ملحق" يُفحص الفصل الذي قبله أيضًا (فصلان) تحسبًا
+        لتعثّر متكرر لم يُحسم بعد.
+     3) للطلاب الذين لا يملكون سجل تسجيل داخل النظام أصلاً (طلاب حاليون تم
+        استيرادهم بأداة "إضافة مجموعة طلاب") يُستعان بدلًا من ذلك بحقلي
+        الطالب priorResultStatus/priorResultForLevel (نتيجة احتياطية مُدخَلة
+        عند الاستيراد) بشرط أن تُطابق نفس المستوى الحالي بالضبط. */
 async function checkSemesterClearance(studentId, semesterId){
   const rec = await dbGet('academicClearance', studentId+'__'+semesterId);
   if(!rec) return {ok:false, reason:'missing'};
@@ -2458,40 +3170,65 @@ async function getStudentClearanceForRegistration(studentId){
   const student = await dbGet('students', studentId);
   const reasons = [];
 
-  // 1) عوائق مستقلة قائمة على سجل الطالب
+  // 1) عوائق مستقلة قائمة على سجل الطالب — تُفحص دائمًا بلا استثناء
   activeFlags(student).forEach(f=>{
     const t = FLAG_TYPES[f.type] || {label:f.type};
     reasons.push({type:f.type, label:t.label, note:f.note});
   });
 
-  // 2) نتيجة آخر فصل (أو فصلين) سجَّل بهما الطالب فعليًا (معتمَد)
+  const currentLevel = student.currentLevel||1;
+  const nextLevel = currentLevel+1;
+  // قاعدة جديدة: نتيجة معتمدة مطلوبة فقط عند التسجيل لفصل دراسي فردي
+  // (٣، ٥، ٧، ٩، ١١...). الفصول الزوجية لا تتطلب أي نتيجة مسبقة.
+  const resultGateApplies = nextLevel>=3 && (nextLevel%2===1);
+
+  if(!resultGateApplies){
+    return {ok: reasons.length===0, reasons, level: currentLevel, resultGateApplies:false};
+  }
+
+  // 2) نتيجة آخر فصل (أو فصلين) سجَّل بهما الطالب فعليًا (معتمَد) داخل النظام
   const allSemesters = await dbGetAll('semesters');
   const myRegs = (await dbGetAllByIndex('registrations','studentId', studentId)).filter(r=> r.status==='registered');
   const mySemesterIds = [...new Set(myRegs.map(r=>r.semesterId))];
   const myPastSemesters = allSemesters.filter(s=> mySemesterIds.includes(s.id))
     .sort((a,b)=> new Date(b.createdAt||0) - new Date(a.createdAt||0));
 
-  if(!myPastSemesters.length){
-    return {ok: reasons.length===0, firstTime:true, reasons, level: student.currentLevel||1};
+  if(myPastSemesters.length){
+    const lastSem = myPastSemesters[0];
+    const lastCheck = await checkSemesterClearance(studentId, lastSem.id);
+    if(!lastCheck.ok){
+      reasons.push({type:lastCheck.reason==='missing'?'missing':'رسوب',
+        label: lastCheck.reason==='missing' ? `لم تُعتمد بعد نتيجة الفصل السابق (${lastSem.name})` : `رسوب في الفصل السابق (${lastSem.name})`,
+        note: lastCheck.note});
+    }
+    if(lastCheck.supplementary && myPastSemesters[1]){
+      const prevSem = myPastSemesters[1];
+      const prevCheck = await checkSemesterClearance(studentId, prevSem.id);
+      if(!prevCheck.ok){
+        reasons.push({type:prevCheck.reason==='missing'?'missing':'رسوب',
+          label: prevCheck.reason==='missing' ? `لم تُعتمد بعد نتيجة الفصل الذي قبل السابق (${prevSem.name})` : `رسوب في الفصل الذي قبل السابق (${prevSem.name})`,
+          note: prevCheck.note});
+      }
+    }
+    return {ok: reasons.length===0, reasons, level: currentLevel, lastSem, resultGateApplies:true};
   }
 
-  const lastSem = myPastSemesters[0];
-  const lastCheck = await checkSemesterClearance(studentId, lastSem.id);
-  if(!lastCheck.ok){
-    reasons.push({type:lastCheck.reason==='missing'?'missing':'رسوب',
-      label: lastCheck.reason==='missing' ? `لم تُعتمد بعد نتيجة الفصل السابق (${lastSem.name})` : `رسوب في الفصل السابق (${lastSem.name})`,
-      note: lastCheck.note});
-  }
-  if(lastCheck.supplementary && myPastSemesters[1]){
-    const prevSem = myPastSemesters[1];
-    const prevCheck = await checkSemesterClearance(studentId, prevSem.id);
-    if(!prevCheck.ok){
-      reasons.push({type:prevCheck.reason==='missing'?'missing':'رسوب',
-        label: prevCheck.reason==='missing' ? `لم تُعتمد بعد نتيجة الفصل الذي قبل السابق (${prevSem.name})` : `رسوب في الفصل الذي قبل السابق (${prevSem.name})`,
-        note: prevCheck.note});
+  // 3) لا يوجد سجل تسجيل داخل النظام إطلاقًا — على الأرجح طالب حالي تم
+  //    استيراده عبر أداة "إضافة مجموعة طلاب"؛ استخدم النتيجة الاحتياطية إن
+  //    وُجدت وطابقت نفس المستوى الحالي بالضبط (تفاديًا لإعادة استخدام نتيجة
+  //    قديمة أو غير متعلقة بهذا الفصل تحديدًا)
+  if(student.priorResultStatus && student.priorResultForLevel===currentLevel){
+    if(student.priorResultStatus==='blocked'){
+      reasons.push({type:'رسوب', label:'رسوب وفق النتيجة المستوردة سابقًا', note: student.priorResultNote||''});
+    } else if(student.priorResultStatus==='supplementary'){
+      // ملحق كنتيجة احتياطية: نقبله دون طلب فصل إضافي إذ لا نملك تاريخًا
+      // أعمق من هذه النتيجة الاحتياطية الوحيدة المتاحة.
     }
+    return {ok: reasons.length===0, reasons, level: currentLevel, resultGateApplies:true, usedPriorResult:true};
   }
-  return {ok: reasons.length===0, reasons, level: student.currentLevel||1, lastSem};
+
+  reasons.push({type:'missing', label:'لا توجد نتيجة معتمدة أو مستوردة لهذا الطالب تُخوّله التسجيل لهذا الفصل'});
+  return {ok: reasons.length===0, reasons, level: currentLevel, firstTime:true, resultGateApplies:true};
 }
 
 /* ==================== بوابة الطالب: التسجيل الفصلي ====================
@@ -2507,6 +3244,11 @@ async function renderMyRegistration(){
   if(!semId){ vp.innerHTML = `<div class="card empty-state"><div class="icon">📭</div><h3>لا يوجد فصل دراسي مفتوح للتسجيل حاليًا</h3></div>`; return; }
   const sem = await dbGet('semesters', semId);
   const semPickerHtml = openSemesters.length>1 ? `<div class="field" style="max-width:340px;"><label>اختر الفصل الدراسي</label><select onchange="navigate('myregistration',{semId:this.value})">${openSemesters.map(s=>`<option value="${s.id}" ${s.id===semId?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}</select></div>` : '';
+  const semFinanceHtml = `<div class="hint-box" style="text-align:start;line-height:2;">
+    <div>فترة التسجيل: <b>${fmtDate(sem.regStart)} — ${fmtDate(sem.regEnd)}</b></div>
+    ${(sem.regFee||sem.tuitionFee)? `<div>رسوم التسجيل: <b>${fmtMoney(sem.regFee)}</b> · المصروفات الدراسية: <b>${fmtMoney(sem.tuitionFee)}</b> · المجموع: <b>${fmtMoney((Number(sem.regFee)||0)+(Number(sem.tuitionFee)||0))}</b></div>`:''}
+    ${sem.bankInfo? `<div>جهة/حساب سداد الرسوم: <b>${escapeHtml(sem.bankInfo)}</b></div>`:''}
+  </div>`;
 
   const clearance = await getStudentClearanceForRegistration(student.id);
   if(!clearance.ok){
@@ -2524,19 +3266,35 @@ async function renderMyRegistration(){
 
   if(activeReq){
     const offerings = await Promise.all(activeReq.offeringIds.map(id=>dbGet('offerings', id)));
+    const regsForReq = await dbGetAllByIndex('registrations','requestId', activeReq.id);
+    const anyWaitlisted = regsForReq.some(r=>r.status==='waitlisted');
     vp.innerHTML = `
       <div class="card">
         <h2>التسجيل الفصلي — ${escapeHtml(sem.name)}</h2>
         ${semPickerHtml}
+        ${semFinanceHtml}
         <div class="hint-box ${activeReq.status==='approved'?'good-box':''}">
           حالة الطلب: <b>${activeReq.status==='approved'?'معتمد ✅':'قيد المراجعة المالية ⏳'}</b>
           ${activeReq.status==='pending'? ' — سيتم إعلامك بعد مراجعة إشعار التوريد من إدارة القبول والتسجيل.' : ''}
+          ${anyWaitlisted? ' يتضمن هذا الطلب مقررًا واحدًا أو أكثر بقائمة الانتظار — سيُسجَّل تلقائيًا فور توفر مقعد.' : ''}
         </div>
         <div class="table-wrap"><table>
-          <thead><tr><th>المقرر</th><th>الساعات</th></tr></thead>
-          <tbody>${offerings.filter(Boolean).map(o=>{ const c=courses.find(x=>x.id===o.courseId); return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${c?c.creditHours:''}</td></tr>`; }).join('')}</tbody>
+          <thead><tr><th>المقرر</th><th>الساعات</th><th>الحالة</th></tr></thead>
+          <tbody>${offerings.filter(Boolean).map(o=>{
+            const c=courses.find(x=>x.id===o.courseId);
+            const reg = regsForReq.find(r=>r.offeringId===o.id);
+            const st = reg ? reg.status : 'pending';
+            const pill = st==='registered' ? '<span class="pill pill-good">معتمد</span>'
+              : st==='waitlisted' ? '<span class="pill pill-mid">قائمة انتظار</span>'
+              : '<span class="pill pill-gold">قيد المراجعة</span>';
+            return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${c?c.creditHours:''}</td><td>${pill}</td></tr>`;
+          }).join('')}</tbody>
         </table></div>
         <p class="muted" style="margin-top:10px;">رقم الإيصال المُدخل: ${escapeHtml(activeReq.receiptNumber||'—')}</p>
+        ${activeReq.totalDue>0? `<div class="hint-box ${activeReq.remainingAmount>0?'warn-box':''}" style="text-align:start;">
+          إجمالي المستحق: <b>${fmtMoney(activeReq.totalDue)}</b> · المدفوع: <b>${fmtMoney(activeReq.amountPaid)}</b> · المتبقي: <b>${fmtMoney(activeReq.remainingAmount)}</b>
+          ${activeReq.isPartialPayment? `<br>دفعة جزئية (حالة خاصة): ${escapeHtml(activeReq.partialReason||'')}`:''}
+        </div>`:''}
         ${activeReq.status==='pending'? `<button class="btn btn-outline btn-sm" onclick="cancelPendingRequest('${activeReq.id}','${semId}')">إلغاء الطلب</button>` : `<p class="muted">لإضافة أو حذف مقررات بعد الاعتماد، يرجى مراجعة إدارة القبول والتسجيل.</p>`}
       </div>
     `;
@@ -2555,30 +3313,34 @@ async function renderMyRegistration(){
     if(!off){ status='missing'; note='لم يُفتح بعد شعبة لهذا المقرر لهذا الفصل'; }
     else{
       const held = allRegs.filter(r=>r.offeringId===off.id && (r.status==='registered'||r.status==='pending')).length;
-      if(held>=off.capacity){ status='full'; note='الشعبة ممتلئة'; }
+      if(held>=off.capacity){ status='full'; note='الشعبة ممتلئة — سينضم طلبك لقائمة الانتظار حتى يتوفر مقعد'; }
     }
     return {course:c, offering:off, status, note};
   });
-  const readyRows = rows.filter(r=>r.status==='ready');
-  const totalHours = readyRows.reduce((s,r)=>s+(r.course.creditHours||0),0);
+  // المقررات "الجاهزة" و"الممتلئة" كلتاهما قابلة للتسجيل الآن (الثانية تنضم لقائمة انتظار)،
+  // بخلاف "missing" التي لا توجد لها شعبة إطلاقًا فلا يمكن تسجيلها بأي حال.
+  const readyRows = rows.filter(r=>r.status==='ready'||r.status==='full');
+  const totalHours = rows.filter(r=>r.status==='ready').reduce((s,r)=>s+(r.course.creditHours||0),0);
+  const totalDue = (Number(sem.regFee)||0)+(Number(sem.tuitionFee)||0);
 
   vp.innerHTML = `
     <div class="card">
       <h2>التسجيل الفصلي — ${escapeHtml(sem.name)}</h2>
       ${semPickerHtml}
+      ${semFinanceHtml}
       ${rejectedReq? `<div class="hint-box warn-box">تم رفض طلبك السابق${rejectedReq.reviewNote?': '+escapeHtml(rejectedReq.reviewNote):''}. يمكنك تقديم طلب جديد بإيصال صحيح أدناه.</div>`:''}
-      <div class="hint-box">مقرراتك هذا الفصل ثابتة حسب منهج المستوى ${level} لقسمك، ولا حاجة لاختيار الساعات يدويًا. يتطلب التسجيل إرفاق رقم إيصال التوريد المالي وصورة/ملف الإيصال.</div>
-      ${!curriculum? `<div class="hint-box warn-box">لم يُحدَّد بعد منهج المستوى ${level} لقسمك — يرجى مراجعة إدارة القبول والتسجيل.</div>` : ''}
+      <div class="hint-box">مقرراتك هذا الفصل ثابتة حسب منهج الفصل الدراسي ${level} لقسمك، ولا حاجة لاختيار الساعات يدويًا. يتطلب التسجيل إرفاق رقم إيصال التوريد المالي وصورة/ملف الإيصال.</div>
+      ${!curriculum? `<div class="hint-box warn-box">لم يُحدَّد بعد منهج الفصل الدراسي ${level} لقسمك — يرجى مراجعة إدارة القبول والتسجيل.</div>` : ''}
       <div class="table-wrap"><table>
         <thead><tr><th>المقرر</th><th>الساعات</th><th>الحالة</th></tr></thead>
         <tbody>${rows.map(r=>`<tr>
           <td>${escapeHtml(r.course.code)} — ${escapeHtml(r.course.name)}</td>
           <td>${r.course.creditHours}</td>
-          <td>${r.status==='ready'? '<span class="pill pill-good">جاهز</span>' : `<span class="pill pill-warn">${escapeHtml(r.note)}</span>`}</td>
+          <td>${r.status==='ready'? '<span class="pill pill-good">جاهز</span>' : (r.status==='full'? '<span class="pill pill-mid">قائمة انتظار</span>' : `<span class="pill pill-warn">${escapeHtml(r.note)}</span>`)}</td>
         </tr>`).join('') || `<tr><td colspan="3" class="muted" style="text-align:center;padding:20px;">لا توجد مقررات محدَّدة بعد لمستواك</td></tr>`}
         </tbody>
       </table></div>
-      <p class="muted" style="margin-top:8px;">إجمالي الساعات القابلة للتسجيل الآن: <b>${totalHours}</b></p>
+      <p class="muted" style="margin-top:8px;">إجمالي الساعات القابلة للتسجيل الآن: <b>${totalHours}</b>${rows.some(r=>r.status==='full')?' (لا تشمل مقررات قائمة الانتظار حتى تُرقَّى لمقعد فعلي)':''}</p>
     </div>
     <div class="card">
       <h3>البيانات المالية</h3>
@@ -2586,6 +3348,16 @@ async function renderMyRegistration(){
         <div class="field"><label for="reg-receipt-no">رقم الإيصال / إشعار التوريد</label><input id="reg-receipt-no" placeholder="مثال: 20260001"></div>
         <div class="field"><label for="reg-receipt-file">صورة/ملف الإيصال</label><input type="file" id="reg-receipt-file" accept="image/*,.pdf"></div>
       </div>
+      ${totalDue>0? `
+      <div class="row2">
+        <div><div class="muted">إجمالي المبلغ المستحق لهذا الفصل</div><div><b>${fmtMoney(totalDue)}</b></div></div>
+        <div class="field"><label for="reg-amount-paid">المبلغ المدفوع</label><input id="reg-amount-paid" type="number" min="0" value="${totalDue}" disabled onchange="document.getElementById('reg-partial-box').style.display = (Number(this.value)<${totalDue})?'block':'none';"></div>
+      </div>
+      <div class="checkrow"><input type="checkbox" id="reg-partial" onchange="document.getElementById('reg-partial-box').style.display=this.checked?'block':'none'; if(this.checked){document.getElementById('reg-amount-paid').removeAttribute('disabled');} else {document.getElementById('reg-amount-paid').value=${totalDue}; document.getElementById('reg-amount-paid').setAttribute('disabled','disabled');}"><label for="reg-partial">دفعة جزئية (حالة خاصة تتطلب مسوّغًا) — الأصل أن يكون السداد كاملاً دفعة واحدة</label></div>
+      <div id="reg-partial-box" style="display:none;">
+        <div class="field"><label for="reg-partial-reason">سبب الدفع الجزئي (مطلوب)</label><input id="reg-partial-reason" placeholder="مثال: تعثّر مالي مؤقت بموافقة عمادة شؤون الطلاب"></div>
+      </div>
+      ` : ''}
       <div class="err-text" id="reg-err"></div>
     </div>
     <div class="card" style="position:sticky;bottom:10px;">
@@ -2600,6 +3372,7 @@ async function cancelPendingRequest(requestId, semId){
   await dbPut('registrationRequests', req);
   const regs = await dbGetAllByIndex('registrations','requestId', requestId);
   for(const r of regs){ r.status='rejected'; await dbPut('registrations', r); }
+  await promoteWaitlistForOfferings(req.offeringIds);
   await addLog('إلغاء طلب تسجيل من الطالب', requestId);
   toast('تم إلغاء الطلب، يمكنك تقديم طلب جديد الآن');
   navigate('myregistration',{semId});
@@ -2625,33 +3398,54 @@ async function submitRegistration(semId){
   if(!receiptNumber){ toast('الرجاء إدخال رقم الإيصال', true); return; }
   if(!receiptFile){ toast('الرجاء إرفاق صورة/ملف الإيصال', true); return; }
 
-  // إعادة التحقق من السعة لحظة الإرسال (قد تكون تغيّرت أثناء تصفح الطالب للصفحة)
-  const allRegs = await dbGetAll('registrations');
-  const finalRows = readyRows.filter(r=>{
-    const held = allRegs.filter(x=>x.offeringId===r.offering.id && (x.status==='registered'||x.status==='pending')).length;
-    return held < r.offering.capacity;
-  });
-  if(!finalRows.length){ toast('أصبحت جميع شُعب مقررات مستواك ممتلئة، يرجى مراجعة إدارة القبول والتسجيل', true); return; }
+  // البيانات المالية: السداد كامل افتراضيًا؛ الدفعة الجزئية حالة استثنائية تتطلب مسوّغًا
+  const totalDue = (Number(sem.regFee)||0)+(Number(sem.tuitionFee)||0);
+  let amountPaid = totalDue, isPartialPayment = false, partialReason = null;
+  if(totalDue>0){
+    const partialEl = document.getElementById('reg-partial');
+    isPartialPayment = partialEl ? partialEl.checked : false;
+    amountPaid = Number(document.getElementById('reg-amount-paid').value)||0;
+    if(isPartialPayment){
+      partialReason = document.getElementById('reg-partial-reason').value.trim();
+      if(!partialReason){ toast('الرجاء إدخال سبب الدفعة الجزئية', true); return; }
+      if(amountPaid<=0 || amountPaid>=totalDue){ toast('المبلغ المدفوع في حالة الدفع الجزئي يجب أن يكون أقل من إجمالي المستحق وأكبر من صفر', true); return; }
+    } else {
+      amountPaid = totalDue;
+    }
+  }
 
-  const totalHours = finalRows.reduce((s,r)=>s+(r.course.creditHours||0),0);
+  // إعادة التحقق من السعة لحظة الإرسال لتحديد أي المقررات يُحجز لها مقعد فورًا
+  // وأيها ينضم لقائمة الانتظار (بدل إسقاطها بالكامل من الطلب كما كان سابقًا) —
+  // فالمقررات ثابتة إلزامية حسب المنهج، فلا معنى لاستبعادها بسبب امتلاء الشعبة.
+  const allRegs = await dbGetAll('registrations');
+  const finalRows = readyRows.map(r=>{
+    const held = allRegs.filter(x=>x.offeringId===r.offering.id && (x.status==='registered'||x.status==='pending')).length;
+    return {...r, willWaitlist: held>=r.offering.capacity};
+  });
+
+  const totalHours = finalRows.filter(r=>!r.willWaitlist).reduce((s,r)=>s+(r.course.creditHours||0),0);
   const requestId = uid();
   const request = {
     id: requestId, studentId: student.id, semesterId: semId, college: student.college,
     offeringIds: finalRows.map(r=>r.offering.id), totalHours,
     receiptNumber, receiptFile, receiptFileName: receiptFile.name,
+    totalDue, amountPaid, remainingAmount: Math.max(0, totalDue-amountPaid), isPartialPayment, partialReason,
+    paymentHistory: isPartialPayment ? [{amount:amountPaid, note:'الدفعة الأولى عند التسجيل', recordedBy: student.id, recordedAt:new Date().toISOString()}] : [],
     submittedAt: new Date().toISOString(), status:'pending', reviewedBy:null, reviewedAt:null, reviewNote:null,
   };
   await dbPut('registrationRequests', request);
   for(const r of finalRows){
-    await dbPut('registrations', {id:uid(), studentId:student.id, semesterId:semId, offeringId:r.offering.id, courseId:r.course.id, creditHours:r.course.creditHours, status:'pending', requestId, registeredAt:new Date().toISOString()});
+    await dbPut('registrations', {id:uid(), studentId:student.id, semesterId:semId, offeringId:r.offering.id, courseId:r.course.id, creditHours:r.course.creditHours, status: r.willWaitlist?'waitlisted':'pending', requestId, registeredAt:new Date().toISOString()});
   }
-  await addLog('تقديم طلب تسجيل فصلي', `${student.name} — ${sem.name} (${totalHours} ساعة)`);
-  toast('تم إرسال طلب التسجيل، بانتظار اعتماد شؤون الطلاب للجانب المالي'); navigate('myregistration',{semId});
+  const waitlistedCount = finalRows.filter(r=>r.willWaitlist).length;
+  await addLog('تقديم طلب تسجيل فصلي', `${student.name} — ${sem.name} (${totalHours} ساعة${waitlistedCount?`، ${waitlistedCount} مقرر بقائمة الانتظار`:''})`);
+  toast(waitlistedCount ? `تم إرسال الطلب — ${waitlistedCount} من مقرراتك أُضيف لقائمة الانتظار حتى يتوفر مقعد` : 'تم إرسال طلب التسجيل، بانتظار اعتماد شؤون الطلاب للجانب المالي');
+  navigate('myregistration',{semId});
 }
 
 async function renderMyHistory(){
   const student = await dbGet('students', currentUser.id);
-  const regs = (await dbGetAllByIndex('registrations','studentId', currentUser.id)).filter(r=>r.status==='registered'||r.status==='pending');
+  const regs = (await dbGetAllByIndex('registrations','studentId', currentUser.id)).filter(r=>r.status==='registered'||r.status==='pending'||r.status==='waitlisted');
   const semesters = await dbGetAll('semesters'); const courses = await dbGetAll('courses'); const offerings = await dbGetAll('offerings');
   const bySem = {};
   regs.forEach(r=>{ (bySem[r.semesterId] = bySem[r.semesterId]||[]).push(r); });
@@ -2660,15 +3454,19 @@ async function renderMyHistory(){
       <h2>سجل تسجيلاتي</h2>
       ${Object.entries(bySem).map(([semId, rows])=>{
         const sem = semesters.find(s=>s.id===semId);
-        const totalHours = rows.reduce((s,r)=>s+r.creditHours,0);
-        const allApproved = rows.every(r=>r.status==='registered');
+        const totalHours = rows.filter(r=>r.status!=='waitlisted').reduce((s,r)=>s+r.creditHours,0);
+        const anyRegistered = rows.some(r=>r.status==='registered');
+        const anyPending = rows.some(r=>r.status==='pending');
+        const anyWaitlisted = rows.some(r=>r.status==='waitlisted');
         return `<div style="margin-bottom:18px;">
           <h3>${escapeHtml(sem?sem.name:'—')} <span class="muted">(${totalHours} ساعة)</span>
-            ${allApproved? `<button class="btn btn-outline btn-sm" onclick="printRegistrationSlip('${semId}')" style="margin-inline-start:8px;">🖨️ طباعة إشعار التسجيل</button>` : `<span class="pill pill-gold" style="margin-inline-start:8px;">قيد المراجعة المالية</span>`}
+            ${anyRegistered? `<button class="btn btn-outline btn-sm" onclick="printRegistrationSlip('${semId}')" style="margin-inline-start:8px;">🖨️ طباعة إشعار التسجيل (المعتمد فقط)</button>` : ''}
+            ${anyPending? `<span class="pill pill-gold" style="margin-inline-start:8px;">قيد المراجعة المالية</span>`:''}
+            ${anyWaitlisted? `<span class="pill pill-mid" style="margin-inline-start:8px;">قائمة انتظار</span>`:''}
           </h3>
           <div class="table-wrap"><table>
             <thead><tr><th>المقرر</th><th>الساعات</th><th>الأستاذ</th><th>الموعد</th><th>الحالة</th></tr></thead>
-            <tbody>${rows.map(r=>{ const c=courses.find(x=>x.id===r.courseId); const o=offerings.find(x=>x.id===r.offeringId); return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${r.creditHours}</td><td>${escapeHtml(o?o.instructor||'—':'—')}</td><td>${o?(o.days||[]).map(dayLabel).join('،')+' '+(o.startTime||''):'—'}</td><td><span class="pill ${r.status==='registered'?'pill-good':'pill-gold'}">${r.status==='registered'?'معتمد':'قيد المراجعة'}</span></td></tr>`; }).join('')}</tbody>
+            <tbody>${rows.map(r=>{ const c=courses.find(x=>x.id===r.courseId); const o=offerings.find(x=>x.id===r.offeringId); const pill = r.status==='registered'?'pill-good':(r.status==='waitlisted'?'pill-mid':'pill-gold'); const label = r.status==='registered'?'معتمد':(r.status==='waitlisted'?'قائمة انتظار':'قيد المراجعة'); return `<tr><td>${escapeHtml(c?c.name:'')}</td><td>${r.creditHours}</td><td>${escapeHtml(o?o.instructor||'—':'—')}</td><td>${o?(o.days||[]).map(dayLabel).join('،')+' '+(o.startTime||''):'—'}</td><td><span class="pill ${pill}">${label}</span></td></tr>`; }).join('')}</tbody>
           </table></div>
         </div>`;
       }).join('') || `<div class="empty-state"><div class="icon">📖</div><h3>لا يوجد سجل تسجيل بعد</h3></div>`}
