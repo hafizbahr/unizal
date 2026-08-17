@@ -382,11 +382,16 @@ function perm(key){ return (currentUser && currentUser.type==='staff') ? !!ROLES
 function myCollegeScope(){ return (currentUser && currentUser.type==='staff' && currentUser.role!=='admin') ? (currentUser.college||null) : null; }
 
 /* أنواع العوائق المستقلة التي تُجمِّد تسجيل الطالب حتى يرفعها الموظف صراحةً
-   («فك تجميد») — مستقلة عن نتيجة الفصل الدراسي نفسها. */
+   («فك تجميد») — مستقلة عن نتيجة الفصل الدراسي نفسها. الأنواع الستة هنا هي كل
+   عوائق التسجيل المعتمَدة بالنظام (تُفحص جميعًا معًا في أي بوابة تسجيل، ذاتية
+   كانت أم جماعية عبر «تسجيل جديد» — انظر checkStudentEligibility). */
 const FLAG_TYPES = {
-  cheating:      {label:'حالة غش',                    icon:'🚫'},
   financial:     {label:'عائق مالي',                   icon:'💰'},
-  supplementary: {label:'ملحق — بانتظار فك التجميد',    icon:'📝'},
+  academic:      {label:'عائق أكاديمي',                icon:'📚'},
+  supplementary: {label:'رسوب في مقرر (ملحق)',          icon:'📝'},
+  cheating:      {label:'حالة غش',                      icon:'🚫'},
+  freeze:        {label:'تجميد قيد',                    icon:'🧊'},
+  dismissal:     {label:'فصل من الجامعة',                icon:'⛔'},
 };
 function activeFlags(student){ return ((student&&student.blockFlags)||[]).filter(f=>!f.liftedAt); }
 
@@ -1035,12 +1040,47 @@ function findColumnKey(sampleRow, candidates){
   return null;
 }
 
-/* ==================== أمان: تجزئة كلمات المرور محليًا (متوافقة مع نمط النظام المرجعي) ==================== */
+/* ==================== أمان: تجزئة كلمات المرور محليًا ====================
+   التجزئة الحالية: PBKDF2-SHA256 بعدد تكرارات كبير (بطيئة عمدًا لمقاومة تخمين
+   كلمات المرور دون اتصال، لو تسرّبت نسخة احتياطية أو قاعدة IndexedDB). الحسابات
+   القديمة (قبل هذا التحديث) كانت مجزَّأة بجولة SHA-256 واحدة فقط ("legacy") —
+   أضعف بكثير أمام هجمات القوة الغاشمة. للحفاظ على قدرة هذه الحسابات على الدخول
+   دون إجبار كل المستخدمين على إعادة تعيين كلمة مرورهم يدويًا، verifyStaffLogin/
+   verifyStudentLogin يتحققان بالخوارزمية المسجَّلة فعليًا على كل حساب (حقل
+   hashAlgo/authAlgo)، ثم يُرقّيان الحساب تلقائيًا وبصمت إلى PBKDF2 بمجرد نجاح
+   أول دخول صحيح — تمامًا كما تفعل الأنظمة المرجعية الحديثة. */
+const PBKDF2_ITERATIONS = 150000;
 function genSalt(){ const a=new Uint8Array(16); crypto.getRandomValues(a); return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join(''); }
-async function hashPassword(pw, salt){
+function hexToBytes(hex){ const a=new Uint8Array(hex.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(hex.substr(i*2,2),16); return a; }
+function bytesToHex(buf){ return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+// الخوارزمية القديمة (جولة SHA-256 واحدة) — للتحقق من الحسابات القديمة فقط، لا تُستخدم لإنشاء حسابات جديدة أبدًا.
+async function hashPasswordLegacy(pw, salt){
   const data = new TextEncoder().encode(salt+':'+pw);
   const buf = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  return bytesToHex(buf);
+}
+// الخوارزمية الحالية لكل كلمة مرور جديدة أو مُعاد تعيينها.
+async function hashPasswordPBKDF2(pw, saltHex, iterations){
+  iterations = iterations || PBKDF2_ITERATIONS;
+  const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), {name:'PBKDF2'}, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({name:'PBKDF2', salt:hexToBytes(saltHex), iterations, hash:'SHA-256'}, keyMaterial, 256);
+  return bytesToHex(bits);
+}
+// نقطة الإنشاء الوحيدة لأي كلمة مرور جديدة في النظام — تُرجع {salt, hash, hashAlgo, hashIter} جاهزة للتخزين.
+async function makeNewPasswordRecord(pw){
+  const salt = genSalt();
+  const hash = await hashPasswordPBKDF2(pw, salt, PBKDF2_ITERATIONS);
+  return {salt, hash, hashAlgo:'pbkdf2', hashIter:PBKDF2_ITERATIONS};
+}
+// يتحقق من كلمة مرور مقابل سجل مخزَّن (salt/hash/hashAlgo/hashIter) بصرف النظر عن
+// عمر الحساب أو خوارزميته، ويُرجع أيضًا ما إذا كان يلزم ترقية الحساب صامتًا.
+async function verifyPasswordRecord(pw, record){
+  const algo = record.hashAlgo || 'legacy';
+  const computed = algo==='pbkdf2'
+    ? await hashPasswordPBKDF2(pw, record.salt, record.hashIter||PBKDF2_ITERATIONS)
+    : await hashPasswordLegacy(pw, record.salt);
+  const ok = computed===record.hash;
+  return {ok, needsUpgrade: ok && algo!=='pbkdf2'};
 }
 function validatePasswordStrength(pw){
   if(!pw || pw.length<6) return {ok:false, msg:'كلمة المرور يجب ألا تقل عن 6 أحرف'};
@@ -1149,10 +1189,10 @@ async function addLog(action, details){
 /* ==================== المصادقة: الموظفون ==================== */
 async function createStaffAccount(username, password, role, college, extra){
   extra = extra||{};
-  const salt = genSalt();
-  const hash = await hashPassword(password, salt);
+  const rec = await makeNewPasswordRecord(password);
   await dbPut('users', {
-    username, salt, hash, role, college: role==='admin' ? null : (college||null),
+    username, salt:rec.salt, hash:rec.hash, hashAlgo:rec.hashAlgo, hashIter:rec.hashIter,
+    role, college: role==='admin' ? null : (college||null),
     fullName: extra.fullName||null, jobTitle: extra.jobTitle||null, phone: extra.phone||null,
     active:true, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(),
   });
@@ -1160,25 +1200,43 @@ async function createStaffAccount(username, password, role, college, extra){
 }
 async function verifyStaffLogin(username, password){
   const user = await dbGet('users', username);
-  if(!user || user.active===false) return null;
-  const hash = await hashPassword(password, user.salt);
-  return hash===user.hash ? user : null;
+  if(!user || user.active===false || !user.hash) return null;
+  const {ok, needsUpgrade} = await verifyPasswordRecord(password, user);
+  if(!ok) return null;
+  if(needsUpgrade){
+    // ترقية صامتة لخوارزمية أقوى بمجرد أول دخول ناجح بحساب قديم — المستخدم لا يلاحظ شيئًا.
+    const rec = await makeNewPasswordRecord(password);
+    user.salt=rec.salt; user.hash=rec.hash; user.hashAlgo=rec.hashAlgo; user.hashIter=rec.hashIter; user.updatedAt=new Date().toISOString();
+    await dbPut('users', user);
+  }
+  return user;
 }
-/* ==================== المصادقة: الطلاب (كلمة المرور مخزنة على سجل الطالب) ==================== */
-async function setStudentPassword(studentId, password){
+/* ==================== المصادقة: الطلاب (كلمة المرور مخزنة على سجل الطالب) ====================
+   isTemp=true يُستخدم عند توليد كلمة مرور مؤقتة (تسجيل جديد أو إعادة تعيين من
+   موظف) فيُعلَّم الحساب بـmustChangePassword ليُجبَر الطالب على تغييرها فور أول
+   دخول (انظر enforceStudentPasswordChange). عندما يغيّر الطالب كلمة مروره بنفسه
+   (isTemp=false) يُرفَع هذا العلَم تلقائيًا. */
+async function setStudentPassword(studentId, password, isTemp){
   const student = await dbGet('students', studentId);
   if(!student) throw new Error('طالب غير موجود');
-  const salt = genSalt();
-  const hash = await hashPassword(password, salt);
-  student.authSalt = salt; student.authHash = hash; student.updatedAt = new Date().toISOString();
+  const rec = await makeNewPasswordRecord(password);
+  student.authSalt = rec.salt; student.authHash = rec.hash; student.authAlgo = rec.hashAlgo; student.authIter = rec.hashIter;
+  student.mustChangePassword = !!isTemp;
+  student.updatedAt = new Date().toISOString();
   await dbPut('students', student);
   ensureCloudAuthAccount(emailForStudentId(studentId), password); // best-effort، لا يُنتظَر ولا يُعطِّل الواجهة
 }
 async function verifyStudentLogin(studentId, password){
   const student = await dbGet('students', studentId);
   if(!student || student.deleted || !student.authHash) return null;
-  const hash = await hashPassword(password, student.authSalt);
-  return hash===student.authHash ? student : null;
+  const {ok, needsUpgrade} = await verifyPasswordRecord(password, {salt:student.authSalt, hash:student.authHash, hashAlgo:student.authAlgo, hashIter:student.authIter});
+  if(!ok) return null;
+  if(needsUpgrade){
+    const rec = await makeNewPasswordRecord(password);
+    student.authSalt=rec.salt; student.authHash=rec.hash; student.authAlgo=rec.hashAlgo; student.authIter=rec.hashIter; student.updatedAt=new Date().toISOString();
+    await dbPut('students', student);
+  }
+  return student;
 }
 
 /* ==================== توليد رقم التسجيل (رقم القيد) ====================
@@ -1219,7 +1277,7 @@ async function createStudentFromAdmission(data){
     createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), deleted:false,
   };
   await dbPut('students', row);
-  await setStudentPassword(studentId, tempPw);
+  await setStudentPassword(studentId, tempPw, true);
   return {row, tempPw};
 }
 
@@ -1308,7 +1366,8 @@ function __sbMap(table, r){
       completed_courses:r.completedCourses||[], current_level:r.currentLevel||1, block_flags:r.blockFlags||[],
       level_advanced_for_semesters:r.levelAdvancedForSemesters||[],
       prior_result_status:r.priorResultStatus||null, prior_result_for_level:r.priorResultForLevel||null, prior_result_note:r.priorResultNote||null,
-      auth_salt:r.authSalt||null, auth_hash:r.authHash||null,
+      auth_salt:r.authSalt||null, auth_hash:r.authHash||null, auth_algo:r.authAlgo||null, auth_iter:r.authIter||null,
+      must_change_password:!!r.mustChangePassword, deleted_at:r.deletedAt||null, deleted_by:r.deletedBy||null,
       created_at:r.createdAt, updated_at:r.updatedAt||new Date().toISOString(), deleted:!!r.deleted};
     case 'departments': return {id:r.id, name:r.name, code:r.code, college:r.college, updated_at:new Date().toISOString()};
     case 'courses': return {id:r.id, code:r.code, name:r.name, college:r.college, credit_hours:r.creditHours, level:r.level||null, prerequisites:r.prerequisites||[], updated_at:new Date().toISOString()};
@@ -1324,7 +1383,7 @@ function __sbMap(table, r){
       is_partial_payment:!!r.isPartialPayment, partial_reason:r.partialReason||null, payment_history:r.paymentHistory||[],
       submitted_at:r.submittedAt, status:r.status, reviewed_by:r.reviewedBy||null, reviewed_at:r.reviewedAt||null, review_note:r.reviewNote||null, updated_at:new Date().toISOString()};
     case 'academicClearance': return {id:r.id, student_id:r.studentId, semester_id:r.semesterId, status:r.status, note:r.note||null, imported_at:r.importedAt, imported_by:r.importedBy||null};
-    case 'users': return {username:r.username, salt:r.salt, hash:r.hash, role:r.role, college:r.college||null, full_name:r.fullName||null, job_title:r.jobTitle||null, phone:r.phone||null, active:r.active!==false, created_at:r.createdAt, updated_at:r.updatedAt||new Date().toISOString()};
+    case 'users': return {username:r.username, salt:r.salt, hash:r.hash, hash_algo:r.hashAlgo||null, hash_iter:r.hashIter||null, role:r.role, college:r.college||null, full_name:r.fullName||null, job_title:r.jobTitle||null, phone:r.phone||null, active:r.active!==false, created_at:r.createdAt, updated_at:r.updatedAt||new Date().toISOString()};
     case 'logs': return {id:r.id, ts:r.ts, actor:r.actor, action:r.action, details:r.details||null};
     default: return r;
   }
@@ -1336,7 +1395,9 @@ function __sbUnmap(table, r){
       phone:r.phone, email:r.email, notes:r.notes, status:r.status, isGraduate:!!r.is_graduate, completedCourses:r.completed_courses||[],
       currentLevel:r.current_level||1, blockFlags:r.block_flags||[], levelAdvancedForSemesters:r.level_advanced_for_semesters||[],
       priorResultStatus:r.prior_result_status||null, priorResultForLevel:r.prior_result_for_level||null, priorResultNote:r.prior_result_note||null,
-      authSalt:r.auth_salt, authHash:r.auth_hash, createdAt:r.created_at, updatedAt:r.updated_at, deleted:!!r.deleted};
+      authSalt:r.auth_salt, authHash:r.auth_hash, authAlgo:r.auth_algo||null, authIter:r.auth_iter||null,
+      mustChangePassword:!!r.must_change_password, deletedAt:r.deleted_at||null, deletedBy:r.deleted_by||null,
+      createdAt:r.created_at, updatedAt:r.updated_at, deleted:!!r.deleted};
     case 'departments': return {id:r.id, name:r.name, code:r.code, college:r.college};
     case 'courses': return {id:r.id, code:r.code, name:r.name, college:r.college, creditHours:r.credit_hours, level:r.level, prerequisites:r.prerequisites||[]};
     case 'curricula': return {id:r.id, departmentId:r.department_id, level:r.level, courseIds:r.course_ids||[], updatedAt:r.updated_at};
@@ -1350,7 +1411,7 @@ function __sbUnmap(table, r){
       partialReason:r.partial_reason, paymentHistory:r.payment_history||[],
       submittedAt:r.submitted_at, status:r.status, reviewedBy:r.reviewed_by, reviewedAt:r.reviewed_at, reviewNote:r.review_note};
     case 'academicClearance': return {id:r.id, studentId:r.student_id, semesterId:r.semester_id, status:r.status, note:r.note, importedAt:r.imported_at, importedBy:r.imported_by};
-    case 'users': return {username:r.username, salt:r.salt, hash:r.hash, role:r.role, college:r.college, fullName:r.full_name, jobTitle:r.job_title, phone:r.phone, active:r.active!==false, createdAt:r.created_at, updatedAt:r.updated_at};
+    case 'users': return {username:r.username, salt:r.salt, hash:r.hash, hashAlgo:r.hash_algo||null, hashIter:r.hash_iter||null, role:r.role, college:r.college, fullName:r.full_name, jobTitle:r.job_title, phone:r.phone, active:r.active!==false, createdAt:r.created_at, updatedAt:r.updated_at};
     case 'logs': return {id:r.id, ts:r.ts, actor:r.actor, action:r.action, details:r.details};
     default: return r;
   }
@@ -1476,7 +1537,7 @@ async function init(){
         if(u && u.active!==false){ currentUser = {type:'staff', username:u.username, role:u.role, college:u.college, fullName:u.fullName}; }
       } else if(parsed.type==='student'){
         const s = await dbGet('students', parsed.id);
-        if(s && !s.deleted){ currentUser = {type:'student', id:s.id, name:s.name, college:s.college}; }
+        if(s && !s.deleted){ currentUser = {type:'student', id:s.id, name:s.name, college:s.college, mustChangePassword:!!s.mustChangePassword}; }
       }
     }
   }catch(e){ try{ sessionStorage.removeItem('zru_session'); }catch(e2){} }
@@ -1494,7 +1555,27 @@ document.addEventListener('keydown', function(e){
   }
 });
 
+/* ==================== تسجيل الخروج التلقائي عند الخمول ====================
+   حماية للأجهزة المشتركة (مثل مكاتب القبول والتسجيل): بعد فترة خمول طويلة
+   دون أي تفاعل مع الصفحة، يُسجَّل خروج المستخدم تلقائيًا. المؤقت يُعاد ضبطه مع
+   أي نقر/ضغط مفتاح/لمس/تمرير، ويعمل فقط أثناء وجود جلسة مفتوحة (currentUser). */
+const INACTIVITY_TIMEOUT_MS = 20*60*1000; // 20 دقيقة خمول
+let __inactivityTimer = null;
+function resetInactivityTimer(){
+  if(__inactivityTimer) clearTimeout(__inactivityTimer);
+  if(!currentUser) return;
+  __inactivityTimer = setTimeout(async ()=>{
+    if(!currentUser) return;
+    await doLogout();
+    toast('تم تسجيل خروجك تلقائيًا لعدم النشاط لفترة طويلة، لحماية حسابك', true);
+  }, INACTIVITY_TIMEOUT_MS);
+}
+['click','keydown','touchstart','scroll'].forEach(evt=>
+  document.addEventListener(evt, ()=>{ if(currentUser) resetInactivityTimer(); }, {passive:true})
+);
+
 async function doLogout(){
+  if(__inactivityTimer){ clearTimeout(__inactivityTimer); __inactivityTimer=null; }
   await addLog('تسجيل الخروج');
   if(supabaseClient){
     try{ if(__sbFlushTimer){ clearTimeout(__sbFlushTimer); __sbFlushTimer=null; } await withTimeout(__flushSyncQueue(), 8000, 'SYNC_TIMEOUT'); }catch(e){}
@@ -1514,6 +1595,13 @@ function enterShell(){
   document.getElementById('brandBadge').innerHTML = `<img src="${UNIV_LOGO_DATA_URI}" alt="شعار الجامعة">`;
   document.getElementById('whoName').textContent = currentUser.type==='staff' ? (currentUser.fullName||currentUser.username) : currentUser.name;
   document.getElementById('whoRole').textContent = currentUser.type==='staff' ? (ROLES[currentUser.role].label + (myCollegeScope()? ' — '+collegeLabel(myCollegeScope()) : '')) : ('طالب — '+collegeLabel(currentUser.college));
+  resetInactivityTimer();
+  if(currentUser.type==='student' && currentUser.mustChangePassword){
+    document.getElementById('tabsNav').innerHTML = '';
+    renderForceChangePassword();
+    refreshNotifBadge();
+    return;
+  }
   buildNav();
   navigate('dashboard');
   refreshNotifBadge();
@@ -1641,7 +1729,7 @@ async function submitStudentLogin(){
   }catch(e){}
   const s = await verifyStudentLogin(id, pass);
   if(!s){ err.textContent='بيانات الدخول غير صحيحة'; err.classList.add('show'); return; }
-  currentUser = {type:'student', id:s.id, name:s.name, college:s.college};
+  currentUser = {type:'student', id:s.id, name:s.name, college:s.college, mustChangePassword:!!s.mustChangePassword};
   try{ sessionStorage.setItem('zru_session', JSON.stringify({type:'student', id:s.id})); }catch(e){}
   await addLog('تسجيل دخول طالب');
   if(cloudAuthed){ try{ await withTimeout(silentPullMergeAll(), 15000, 'SYNC_TIMEOUT'); }catch(e){} }
@@ -1657,10 +1745,12 @@ function staffTabs(){
   if(perm('canManageCatalog')) tabs.push({id:'courses', label:'📚 دليل المقررات'});
   if(perm('canManageCatalog')) tabs.push({id:'curricula', label:'📖 المناهج الدراسية'});
   if(perm('canManageSemesters')) tabs.push({id:'semesters', label:'📅 الفصول الدراسية'});
+  if(perm('canManageSemesters')) tabs.push({id:'newRegistration', label:'🆕 تسجيل جديد'});
   tabs.push({id:'registrations', label:'📝 متابعة التسجيل'});
   tabs.push({id:'reports', label:'📊 التقارير'});
   if(perm('canManageUsers')) tabs.push({id:'users', label:'👥 المستخدمون'});
   if(perm('canViewLogs')) tabs.push({id:'logs', label:'🧾 سجل الأحداث'});
+  if(perm('canManageStudents')) tabs.push({id:'trash', label:'🗑️ المحذوفون'});
   tabs.push({id:'settings', label:'⚙️ الإعدادات'});
   tabs.push({id:'myprofile', label:'👤 بياناتي'});
   return tabs;
@@ -1680,6 +1770,9 @@ function buildNav(){
   ).join('');
 }
 function navigate(view, params){
+  if(currentUser && currentUser.type==='student' && currentUser.mustChangePassword && view!=='forceChangePassword'){
+    view = 'forceChangePassword'; params = {};
+  }
   currentView = view; viewParams = params||{};
   document.querySelectorAll('nav.tabs button').forEach(b=> b.classList.toggle('active', b.dataset.tab===view));
   render();
@@ -1694,8 +1787,10 @@ async function render(){
       studentDetail: renderStudentDetail, departments: renderDepartments, courses: renderCourses,
       curricula: renderCurricula,
       semesters: renderSemesters, semesterDetail: renderSemesterDetail, registrations: renderRegistrationsMonitor,
-      reports: renderReports, users: renderUsers, logs: renderLogs, settings: renderSettings,
+      reports: renderReports, users: renderUsers, logs: renderLogs, settings: renderSettings, trash: renderTrash,
+      newRegistration: renderNewRegistration,
       myregistration: renderMyRegistration, myhistory: renderMyHistory, myprofile: renderMyProfile,
+      forceChangePassword: renderForceChangePassword,
     };
     const fn = map[currentView] || renderDashboard;
     await fn();
@@ -1881,7 +1976,7 @@ async function renderDashboard(){
         <button class="btn btn-outline" onclick="navigate('reports')">📊 عرض التقارير</button>
         <button class="btn btn-outline" onclick="navigate('myprofile')">👤 بياناتي</button>
       </div>
-      <div class="hint-box">هذا النظام متوافق مع نظام السجل الأكاديمي الإلكتروني لجامعة زالنجي (نفس الكليات وهوية التصميم)، مع إمكانية تصدير بيانات الطلاب بصيغة متوافقة لدمجها لاحقًا (تبويب «الإعدادات»).</div>
+      <div class="hint-box">مصدرا بيانات الطلاب في هذا النظام: (1) <b>كشوفات القبول</b> الرسمية من الوزارة للطلاب الجدد (تبويب «كشوفات القبول»)، و(2) <b>نظام السجل الأكاديمي الإلكتروني</b> لجامعة زالنجي للطلاب الحاليين/المنقولين (زر «إضافة مجموعة طلاب حاليين» بتبويب «الطلاب»). ويمكن أيضًا تصدير بيانات الطلاب بصيغة متوافقة مع السجل الأكاديمي الإلكتروني للدمج العكسي لاحقًا (تبويب «الإعدادات»).</div>
     </div>
   `;
 }
@@ -2088,11 +2183,16 @@ async function renderAdmissions(){
   const recent = students.slice().sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt)).slice(0,15);
   document.getElementById('viewport').innerHTML = `
     <div class="card">
-      <h2>كشوفات القبول من وزارة التعليم العالي</h2>
-      <p class="muted" style="line-height:1.9;">القبول مقرر مسبقًا من الوزارة (رقم جامعي، اسم، مدرسة ثانوية). استخدم هذه الصفحة لتسجيل الطلاب المقبولين رسميًا في نظام الجامعة — سيُولَّد لكل طالب رقم تسجيل (قيد) تلقائيًا وكلمة مرور مؤقتة.</p>
+      <h2>📋 كشوفات القبول من وزارة التعليم العالي</h2>
+      <p class="muted" style="line-height:1.9;">هذه الصفحة مخصَّصة حصرًا للطلاب <b>الجدد المقبولين لأول مرة</b> بموجب كشف القبول الرسمي الصادر من وزارة التعليم العالي (رقم جامعي، اسم، مدرسة ثانوية). استخدمها لتسجيلهم في نظام الجامعة ابتداءً من المستوى الأول — سيُولَّد لكل طالب رقم تسجيل (قيد) تلقائيًا وكلمة مرور مؤقتة.</p>
       <div class="row">
         <button class="btn btn-gold" onclick="openManualAdmissionModal()">+ إدخال طالب واحد</button>
         <button class="btn btn-outline" onclick="openBulkAdmissionModal()">📥 استيراد كشف كامل (Excel/CSV)</button>
+      </div>
+      <div class="hint-box" style="margin-top:14px;">
+        📚 لطلاب <b>موجودين مسبقًا</b> في نظام الجامعة (منقولون، أو مستوردون من نظام السجل الأكاديمي الإلكتروني بمستوى دراسي متقدم ونتائج سابقة)، لا تستخدم هذه الصفحة — استخدم بدلًا منها
+        <button class="btn btn-outline btn-sm" onclick="openBulkExistingStudentsModal()">+ إضافة مجموعة طلاب حاليين (من السجل الأكاديمي الإلكتروني)</button>
+        من صفحة "الطلاب".
       </div>
     </div>
     <div class="card">
@@ -2285,10 +2385,10 @@ async function createExistingStudentRecord(data){
   if(resultStatusRaw && String(resultStatusRaw).trim()){
     row.priorResultStatus = normalizeClearanceStatus(resultStatusRaw);
     row.priorResultForLevel = lvl;
-    row.priorResultNote = 'مستوردة عبر أداة إضافة مجموعة طلاب (طلاب حاليون)';
+    row.priorResultNote = 'مستوردة من السجل الأكاديمي الإلكتروني عبر أداة إضافة مجموعة طلاب حاليين';
   }
   await dbPut('students', row);
-  await setStudentPassword(studentId, tempPw);
+  await setStudentPassword(studentId, tempPw, true);
   return {row, tempPw};
 }
 function downloadExistingStudentsTemplate(){
@@ -2301,8 +2401,9 @@ async function openBulkExistingStudentsModal(){
   const college = scope || lastAdmissionCollege || COLLEGES[0].key;
   const depts = await departmentOptionsForCollege(college);
   const year = lastAdmissionYear || new Date().getFullYear();
-  openModal('إضافة مجموعة طلاب (طلاب حاليون)', `
-    <p class="muted" style="line-height:1.9;">لطلاب موجودين فعلاً (ليسوا جددًا) — رقم التسجيل والفصل الدراسي الحالي يُؤخذان كما وردا في الملف ولا يُولَّدان تلقائيًا. الأعمدة المطلوبة: «الرقم الجامعي/الاستمارة»، «رقم التسجيل»، «الاسم»، «الفصل الدراسي الحالي». الأعمدة الاختيارية: «التخصص»، «الدفعة»، «النتيجة» (ناجح/ملحق/راسب — تُستخدم فقط إن لم يوجد للطالب سجل تسجيل سابق داخل النظام، وتُطابَق حصرًا بنفس الفصل الحالي المُدخَل).</p>
+  openModal('إضافة مجموعة طلاب حاليين — من السجل الأكاديمي الإلكتروني', `
+    <div class="hint-box">مصدر هذه البيانات هو <b>نظام السجل الأكاديمي الإلكتروني لجامعة زالنجي</b> (وليس كشف قبول الوزارة) — للطلاب الموجودين فعلًا في الجامعة (منقولون بين النظامين، أو مستوردون لأول مرة لهذا النظام بمستوى دراسي متقدم). صدِّر كشفًا من السجل الأكاديمي الإلكتروني بنفس أعمدة النموذج أدناه ثم استورده هنا.</div>
+    <p class="muted" style="line-height:1.9;">رقم التسجيل والفصل الدراسي الحالي يُؤخذان كما وردا في الملف ولا يُولَّدان تلقائيًا (بخلاف تسجيل طالب جديد من كشف القبول). الأعمدة المطلوبة: «الرقم الجامعي/الاستمارة»، «رقم التسجيل»، «الاسم»، «الفصل الدراسي الحالي». الأعمدة الاختيارية: «التخصص»، «الدفعة»، «النتيجة» (ناجح/ملحق/راسب — تُستخدم فقط إن لم يوجد للطالب سجل تسجيل سابق داخل النظام، وتُطابَق حصرًا بنفس الفصل الحالي المُدخَل).</p>
     <button class="btn btn-outline btn-sm" onclick="downloadExistingStudentsTemplate()">⬇️ تنزيل نموذج الملف</button>
     ${!scope? `<div class="field"><label for="ex-college">الكلية</label><select id="ex-college" onchange="refreshExistingDeptOptions()">${collegeOptionsHtml(college)}</select></div>`:''}
     <div class="field"><label for="ex-dept">القسم/التخصص</label><select id="ex-dept">${depts.map(d=>`<option value="${d.id}">${escapeHtml(d.code)} — ${escapeHtml(d.name)}</option>`).join('') || '<option value="">لا توجد أقسام لهذه الكلية بعد</option>'}</select></div>
@@ -2399,7 +2500,7 @@ async function renderStudents(){
   document.getElementById('viewport').innerHTML = `
     <div class="card">
       <h2>الطلاب${scope?' — '+escapeHtml(collegeLabel(scope)):''} <span class="eyebrow">${list.length}</span>
-        ${perm('canManageAdmissions')? `<button class="btn btn-gold btn-sm" onclick="openManualAdmissionModal()">+ إضافة طالب</button> <button class="btn btn-outline btn-sm" onclick="openBulkExistingStudentsModal()">+ إضافة مجموعة طلاب (طلاب حاليون)</button>`:''}
+        ${perm('canManageAdmissions')? `<button class="btn btn-gold btn-sm" onclick="openManualAdmissionModal()">+ إضافة طالب</button> <button class="btn btn-outline btn-sm" onclick="openBulkExistingStudentsModal()">+ إضافة مجموعة طلاب حاليين (من السجل الأكاديمي الإلكتروني)</button>`:''}
         ${canDelete? `<button class="btn btn-danger btn-sm" id="bulkDeleteBtn" disabled onclick="openBulkDeleteStudentsModal()">🗑️ حذف المحدَّد (<span id="bulkDeleteCount">0</span>)</button>`:''}
       </h2>
       <div class="row" style="margin-bottom:14px;">
@@ -2448,16 +2549,56 @@ function toggleAllStudentChecks(el){
   updateBulkDeleteState();
 }
 /* ==================== حذف طالب — فردي أو جماعي (حذف منطقي/soft-delete) ====================
-   لا يُحذف السجل فعليًا من القاعدة بل يُعلَّم deleted:true، فتبقى سجلاته
-   التاريخية (تسجيلات فصلية، دفعات مالية...) قابلة للتدقيق لاحقًا عند الحاجة،
-   ويختفي فورًا من كل القوائم والتقارير النشطة. الإجراء يتطلب صلاحية
-   canManageStudents ويُسجَّل في سجل الأحداث دائمًا. */
+   لا يُحذف السجل فعليًا من القاعدة بل يُعلَّم deleted:true مع توقيت ومنفِّذ
+   الحذف، فتبقى سجلاته التاريخية (تسجيلات فصلية، دفعات مالية...) قابلة للتدقيق
+   لاحقًا عند الحاجة، ويختفي فورًا من كل القوائم والتقارير النشطة. يمكن استرجاعه
+   لاحقًا من تبويب «المحذوفون» (انظر renderTrash/restoreStudent). الإجراء يتطلب
+   صلاحية canManageStudents ويُسجَّل في سجل الأحداث دائمًا. */
 async function softDeleteStudent(id){
   const student = await dbGet('students', id);
   if(!student) return;
-  student.deleted = true; student.updatedAt = new Date().toISOString();
+  student.deleted = true; student.deletedAt = new Date().toISOString();
+  student.deletedBy = currentUser.type==='staff' ? currentUser.username : null;
+  student.updatedAt = new Date().toISOString();
   await dbPut('students', student);
   await addLog('حذف طالب', `${student.name} — ${student.id}`);
+}
+async function restoreStudent(id){
+  const student = await dbGet('students', id);
+  if(!student) return;
+  student.deleted = false; student.deletedAt = null; student.deletedBy = null;
+  student.updatedAt = new Date().toISOString();
+  await dbPut('students', student);
+  await addLog('استرجاع طالب من المحذوفين', `${student.name} — ${student.id}`);
+  toast('تم استرجاع الطالب'); navigate('trash');
+}
+/* ==================== تبويب «المحذوفون» — استرجاع الطلاب المحذوفين منطقيًا ==================== */
+async function renderTrash(){
+  const scope = myCollegeScope();
+  const list = (await dbGetAll('students')).filter(s=>s.deleted && (!scope||s.college===scope))
+    .sort((a,b)=> new Date(b.deletedAt||0)-new Date(a.deletedAt||0));
+  document.getElementById('viewport').innerHTML = `
+    <div class="card">
+      <h2>🗑️ الطلاب المحذوفون${scope?' — '+escapeHtml(collegeLabel(scope)):''} <span class="eyebrow">${list.length}</span></h2>
+      <p class="muted" style="line-height:1.9;">الحذف من قائمة الطلاب حذف منطقي فقط — تبقى السجلات هنا قابلة للاسترجاع الكامل في أي وقت، ولا تُحذف نهائيًا من قاعدة البيانات.</p>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>الرقم الجامعي</th><th>الاسم</th><th>الكلية</th><th>تاريخ الحذف</th><th>بواسطة</th><th class="fit"></th></tr></thead>
+        <tbody>
+          ${list.map(s=>`
+            <tr>
+              <td>${escapeHtml(s.id)}</td>
+              <td>${escapeHtml(s.name)}</td>
+              <td>${escapeHtml(collegeLabel(s.college))}</td>
+              <td>${s.deletedAt? fmtDateTime(s.deletedAt) : '—'}</td>
+              <td>${escapeHtml(s.deletedBy||'—')}</td>
+              <td class="fit"><button class="btn btn-gold btn-sm" onclick="restoreStudent('${s.id}')">↺ استرجاع</button></td>
+            </tr>`).join('') || `<tr><td colspan="6" class="muted" style="text-align:center;padding:20px;">لا يوجد طلاب محذوفون حاليًا</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  `;
 }
 async function openDeleteStudentModal(id){
   const student = await dbGet('students', id);
@@ -2526,7 +2667,7 @@ async function renderStudentDetail(){
     </div>
     <div class="card">
       <h2>الحالة الأكاديمية والعوائق ${hasActiveFlags?'<span class="pill pill-warn">ممنوع من التسجيل</span>':''}
-        ${perm('canManageAdmissions')? `<button class="btn btn-danger btn-sm" onclick="openAddFlagModal('${id}')">+ إضافة عائق (غش/مالي)</button>`:''}
+        ${perm('canManageAdmissions')? `<button class="btn btn-danger btn-sm" onclick="openAddFlagModal('${id}')">+ إضافة عائق تسجيل</button>`:''}
       </h2>
       ${flags.length? flags.slice().sort((a,b)=> new Date(b.setAt)-new Date(a.setAt)).map(f=>{
         const t = FLAG_TYPES[f.type] || {label:f.type, icon:''};
@@ -2638,7 +2779,7 @@ function openAddFlagModal(studentId){
   openModal('إضافة عائق يمنع التسجيل', `
     <p class="muted">يمنع هذا الطالب من تسجيل أي فصل قادم حتى تُفَك التجميد يدويًا لاحقًا.</p>
     <div class="field"><label for="fl-type">نوع العائق</label>
-      <select id="fl-type"><option value="cheating">حالة غش</option><option value="financial">عائق مالي</option></select>
+      <select id="fl-type">${Object.entries(FLAG_TYPES).map(([k,t])=>`<option value="${k}">${t.icon} ${escapeHtml(t.label)}</option>`).join('')}</select>
     </div>
     <div class="field"><label for="fl-note">ملاحظة (اختياري)</label><textarea id="fl-note" placeholder="تفاصيل الحالة..."></textarea></div>
     <div class="err-text" id="fl-err"></div>
@@ -2698,7 +2839,7 @@ function cloudPasswordSyncReasonLabel(reason){
 async function confirmResetStudentPassword(id){
   const tempPw = genTempPassword();
   const student = await dbGet('students', id);
-  await setStudentPassword(id, tempPw);
+  await setStudentPassword(id, tempPw, true);
   await addLog('إعادة تعيين كلمة مرور طالب', id);
   let cloudNote = '';
   if(supabaseClient){
@@ -2927,7 +3068,7 @@ async function renderCurricula(){
     ${dept? `
     <div class="card">
       <h2>مستويات «${escapeHtml(dept.name)}» <span class="eyebrow">${allCurricula.length}</span>
-        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ فصل دراسي جديد</button> <button class="btn btn-outline btn-sm" onclick="openImportCurriculumModal('${deptId}')">📥 استيراد المنهج من ملف</button>`:''}
+        ${perm('canManageCatalog')? `<button class="btn btn-gold btn-sm" onclick="openCurriculumLevelModal('${deptId}')">+ إضافة مقررات لفصل دراسي</button> <button class="btn btn-outline btn-sm" onclick="openImportCurriculumModal('${deptId}')">📥 استيراد المنهج من ملف</button>`:''}
       </h2>
       ${allCurricula.map(cur=>{
         const list = (cur.courseIds||[]).map(cid=> courses.find(c=>c.id===cid)).filter(Boolean);
@@ -2944,14 +3085,23 @@ async function renderCurricula(){
   `;
 }
 function openCurriculumLevelModal(departmentId, existingLevel){
-  Promise.all([dbGet('departments', departmentId), dbGetAll('courses')]).then(([dept, allCourses])=>{
+  Promise.all([dbGet('departments', departmentId), dbGetAll('courses'), dbGetAllByIndex('curricula','departmentId', departmentId)]).then(([dept, allCourses, existingCurricula])=>{
     const courses = allCourses.filter(c=>c.college===dept.college);
     const editId = (existingLevel!=null) ? departmentId+'__'+existingLevel : null;
+    const takenLevels = new Set(existingCurricula.map(c=>c.level));
     (editId ? dbGet('curricula', editId) : Promise.resolve(null)).then(editing=>{
       const selected = new Set((editing&&editing.courseIds)||[]);
       window.__curCourses = courses;
-      openModal(editing?`تعديل مقررات ${semesterLabel(existingLevel)}`:'إضافة فصل دراسي جديد للمنهج', `
-        <div class="field"><label for="cu-level">رقم الفصل الدراسي</label><input id="cu-level" type="number" min="1" max="12" value="${editing?editing.level:''}" ${editing?'disabled':''}></div>
+      // قائمة الفصول الدراسية نصية دائمًا (الفصل الدراسي الأول، الثاني...) — عند
+      // الإضافة تُستبعَد الفصول المُعرَّفة مسبقًا لهذا القسم (لكل فصل سجل منهج
+      // واحد فقط، ويُعدَّل عبر زر "✏️" لا بإعادة إضافته من هنا).
+      const levelOptions = Array.from({length:12},(_,i)=>i+1).filter(n=> editing ? n===editing.level : !takenLevels.has(n));
+      openModal(editing?`تعديل مقررات ${semesterLabel(existingLevel)}`:'إضافة مقررات لفصل دراسي', `
+        <div class="field"><label for="cu-level">الفصل الدراسي</label>
+          ${editing
+            ? `<input value="${escapeHtml(semesterLabel(editing.level))}" disabled>`
+            : `<select id="cu-level">${levelOptions.length? levelOptions.map(n=>`<option value="${n}">${escapeHtml(semesterLabel(n))}</option>`).join('') : '<option value="">— كل الفصول معرَّفة بالفعل لهذا القسم —</option>'}</select>`}
+        </div>
         <div class="field"><label>مقررات هذا الفصل الدراسي (ثابتة لجميع طلاب القسم فيه)</label>
           <div style="max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:8px;">
             ${courses.map(c=>`<div class="checkrow" style="padding:4px 0;"><input type="checkbox" id="cu-${c.id}" ${selected.has(c.id)?'checked':''}><label for="cu-${c.id}">${escapeHtml(c.code)} — ${escapeHtml(c.name)} (${c.creditHours} س)${c.level? ` <span class="muted" style="font-size:11px;">— مستوى الدليل: ${escapeHtml(String(c.level))}</span>`:''}</label></div>`).join('') || '<div class="muted">لا توجد مقررات في دليل كلية هذا القسم بعد — أضفها أولًا من «دليل المقررات».</div>'}
@@ -2961,20 +3111,20 @@ function openCurriculumLevelModal(departmentId, existingLevel){
         <div class="err-text" id="cu-err"></div>
       `, `
         <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
-        <button class="btn btn-gold" onclick="submitCurriculumLevel('${departmentId}')">حفظ</button>
+        <button class="btn btn-gold" onclick="submitCurriculumLevel('${departmentId}', ${editing?editing.level:'null'})">حفظ</button>
       `);
     });
   });
 }
-async function submitCurriculumLevel(departmentId){
-  const level = parseInt(document.getElementById('cu-level').value,10);
+async function submitCurriculumLevel(departmentId, editingLevel){
+  const level = editingLevel!=null ? editingLevel : parseInt(document.getElementById('cu-level').value,10);
   const err = document.getElementById('cu-err'); err.classList.remove('show');
-  if(!level || level<1){ err.textContent='الرجاء إدخال رقم فصل دراسي صحيح'; err.classList.add('show'); return; }
+  if(!level || level<1){ err.textContent='الرجاء اختيار فصل دراسي'; err.classList.add('show'); return; }
   const courses = window.__curCourses||[];
   const courseIds = courses.filter(c=> document.getElementById('cu-'+c.id) && document.getElementById('cu-'+c.id).checked).map(c=>c.id);
   const id = departmentId+'__'+level;
   await dbPut('curricula', {id, departmentId, level, courseIds, updatedAt:new Date().toISOString()});
-  await addLog('حفظ منهج فصل دراسي', `${departmentId} — ${semesterLabel(level)} (${courseIds.length} مقررًا)`);
+  await addLog('حفظ مقررات فصل دراسي بالمنهج', `${departmentId} — ${semesterLabel(level)} (${courseIds.length} مقررًا)`);
   closeModal(); toast('تم الحفظ'); navigate('curricula',{deptId:departmentId});
 }
 
@@ -3117,6 +3267,125 @@ async function toggleSemesterReg(id){
   await addLog('تغيير حالة التسجيل الفصلي', `${s.name} → ${s.regOpen?'مفتوح':'مغلق'}`);
   toast(s.regOpen?'تم فتح التسجيل':'تم إغلاق التسجيل'); navigate('semesters');
 }
+
+/* ==================== تسجيل جديد — ترقية وتسجيل الطلاب الحاليين جماعيًا ====================
+   الغرض: عند افتتاح فصل دراسي جديد، ترقية قيد كل الطلاب المستمرين المؤهَّلين
+   دفعة واحدة (مستواهم +1) بدل مراجعة كل طالب يدويًا، بعد التحقق أولًا من خلوّهم
+   من كل عوائق التسجيل الستة (مالية، أكاديمية، رسوب/ملحق، غش، تجميد، فصل —
+   محسوبة عبر getStudentClearanceForRegistration نفسها المستخدمة في بوابة تسجيل
+   الطالب الذاتي، فلا يوجد أي ازدواج في المعايير بين المسارين). لا يُنشئ هذا
+   الإجراء تسجيلًا بمقررات بعينها ولا يحصّل أي رسوم — فقط يُرقّي مستوى القيد
+   ويُعلِّم الطالب كمُرقّى لهذا الفصل (levelAdvancedForSemesters) بحيث يصبح
+   بإمكانه بعدها التسجيل بنفسه بمقررات مستواه الجديد من تبويب «تسجيل الفصل»
+   الخاص به، أو أن يسجّله الموظف يدويًا إن رغب.
+   ملاحظة: لا يشمل هذا طلاب الفصل الأول (يُسجَّلون عبر «كشوفات القبول» مباشرة). */
+async function renderNewRegistration(){
+  const scope = myCollegeScope();
+  const semesters = (await dbGetAll('semesters')).sort((a,b)=> new Date(b.createdAt||0)-new Date(a.createdAt||0));
+  const semId = viewParams.semId || (semesters[0]||{}).id || '';
+  const vp = document.getElementById('viewport');
+  if(!semId){ vp.innerHTML = `<div class="card empty-state"><div class="icon">📅</div><h3>أنشئ فصلًا دراسيًا أولاً من تبويب «الفصول الدراسية»</h3></div>`; return; }
+  const sem = semesters.find(s=>s.id===semId);
+  let students = (await dbGetAll('students')).filter(s=>!s.deleted && !s.isGraduate && (!scope||s.college===scope));
+  students.sort((a,b)=> a.name.localeCompare(b.name,'ar'));
+
+  const rows = [];
+  for(const s of students){
+    const alreadyAdvanced = (s.levelAdvancedForSemesters||[]).includes(semId);
+    const clearance = await getStudentClearanceForRegistration(s.id);
+    rows.push({student:s, alreadyAdvanced, clearance});
+  }
+  const eligible = rows.filter(r=>!r.alreadyAdvanced && r.clearance.ok);
+  const blocked = rows.filter(r=>!r.alreadyAdvanced && !r.clearance.ok);
+  const done = rows.filter(r=>r.alreadyAdvanced);
+
+  vp.innerHTML = `
+    <div class="card">
+      <h2>🆕 تسجيل جديد — ترقية وتسجيل الطلاب الحاليين${scope?' — '+escapeHtml(collegeLabel(scope)):''}</h2>
+      <p class="muted" style="line-height:1.9;">يُرقّي هذا الإجراء مستوى القيد (الفصل الدراسي) لكل طالب مستمر مُحدَّد ومؤهَّل — بعد التأكد أولًا من خلوّه من كل عوائق التسجيل (مالية، أكاديمية، رسوب/ملحق، غش، تجميد، فصل) — تمهيدًا لتسجيله بمقررات الفصل الجديد. طلاب الفصل الأول يُسجَّلون عبر «كشوفات القبول» مباشرة وليس من هنا.</p>
+      <div class="field" style="max-width:420px;"><label>الفصل الدراسي الجديد</label>
+        <select onchange="navigate('newRegistration',{semId:this.value})">${semesters.map(s=>`<option value="${s.id}" ${s.id===semId?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}</select>
+      </div>
+      <div class="stat-grid" style="margin-top:14px;">
+        ${statCard('✅', eligible.length, 'مؤهَّلون للترقية الآن')}
+        ${statCard('⛔', blocked.length, 'محجوبون بعائق تسجيل')}
+        ${statCard('🏁', done.length, 'مُرقَّون بالفعل لهذا الفصل')}
+      </div>
+      ${eligible.length? `<button class="btn btn-gold" id="bulkPromoteBtn" onclick="openBulkPromoteConfirm('${semId}')" style="margin-top:14px;">⬆️ ترقية جميع المؤهَّلين المحدَّدين (<span id="bulkPromoteCount">${eligible.length}</span>)</button>`:''}
+    </div>
+    <div class="card">
+      <h2>قائمة الطلاب <span class="eyebrow">${rows.length}</span></h2>
+      <div class="table-wrap">
+      <table>
+        <thead><tr>${eligible.length?'<th class="fit"><input type="checkbox" id="npSelectAll" checked onchange="toggleAllPromoteChecks(this)"></th>':''}<th>الرقم الجامعي</th><th>الاسم</th><th>المستوى الحالي</th><th>الحالة</th></tr></thead>
+        <tbody>
+        ${rows.map(r=>{
+          const disabled = r.alreadyAdvanced || !r.clearance.ok;
+          const statusHtml = r.alreadyAdvanced
+            ? `<span class="pill pill-good">مُرقَّى بالفعل — أصبح ${escapeHtml(semesterLabel((r.student.currentLevel||1)))}</span>`
+            : r.clearance.ok
+              ? `<span class="pill pill-good">مؤهَّل → سيصبح ${escapeHtml(semesterLabel((r.student.currentLevel||1)+1))}</span>`
+              : `<span class="pill pill-warn" title="${escapeHtml(r.clearance.reasons.map(x=>x.label).join('، '))}">${escapeHtml(r.clearance.reasons.map(x=>x.label).join('، '))}</span>`;
+          return `<tr>
+            ${eligible.length?`<td class="fit">${disabled?'':`<input type="checkbox" class="promote-check" value="${r.student.id}" checked onchange="updatePromoteCount()">`}</td>`:''}
+            <td>${escapeHtml(r.student.id)}</td>
+            <td>${escapeHtml(r.student.name)}</td>
+            <td>${escapeHtml(semesterLabel(r.student.currentLevel||1))}</td>
+            <td>${statusHtml}</td>
+          </tr>`;
+        }).join('') || `<tr><td colspan="5" class="muted" style="text-align:center;padding:20px;">لا يوجد طلاب حاليون بهذا النطاق</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  `;
+}
+function updatePromoteCount(){
+  const n = document.querySelectorAll('.promote-check:checked').length;
+  const el = document.getElementById('bulkPromoteCount');
+  if(el) el.textContent = String(n);
+  const btn = document.getElementById('bulkPromoteBtn');
+  if(btn) btn.disabled = n===0;
+  const all = document.querySelectorAll('.promote-check');
+  const selectAll = document.getElementById('npSelectAll');
+  if(selectAll) selectAll.checked = all.length>0 && n===all.length;
+}
+function toggleAllPromoteChecks(el){
+  document.querySelectorAll('.promote-check').forEach(c=> c.checked = el.checked);
+  updatePromoteCount();
+}
+function openBulkPromoteConfirm(semId){
+  const ids = [...document.querySelectorAll('.promote-check:checked')].map(c=>c.value);
+  if(!ids.length) return;
+  window.__bulkPromoteIds = ids;
+  openModal('تأكيد الترقية الجماعية', `
+    <div class="hint-box">سيُرقَّى <b>${ids.length}</b> طالبًا لمستوى الفصل التالي فورًا، ويصبح بإمكانهم تسجيل مقررات فصلهم الجديد. هذا الإجراء لا يُنشئ أي تسجيل بمقررات بعينها ولا يُحصِّل رسومًا — فقط يُرقّي مستوى القيد.</div>
+  `, `
+    <button class="btn btn-outline" onclick="closeModal()">إلغاء</button>
+    <button class="btn btn-gold" onclick="confirmBulkPromote('${semId}')">تأكيد الترقية (${ids.length})</button>
+  `);
+}
+async function confirmBulkPromote(semId){
+  const ids = window.__bulkPromoteIds||[];
+  let promoted = 0;
+  for(const id of ids){
+    const student = await dbGet('students', id);
+    if(!student) continue;
+    const advancedFor = new Set(student.levelAdvancedForSemesters||[]);
+    if(advancedFor.has(semId)) continue; // تحقق مزدوج تحسبًا لتغيّر البيانات أثناء المراجعة
+    student.currentLevel = (student.currentLevel||1) + 1;
+    advancedFor.add(semId);
+    student.levelAdvancedForSemesters = [...advancedFor];
+    student.updatedAt = new Date().toISOString();
+    await dbPut('students', student);
+    promoted++;
+  }
+  const sem = await dbGet('semesters', semId);
+  await addLog('ترقية جماعية للفصل الدراسي الجديد', `${sem?sem.name:semId} — ${promoted} طالب`);
+  window.__bulkPromoteIds = null;
+  closeModal(); toast(`تمت ترقية ${promoted} طالبًا بنجاح`); navigate('newRegistration',{semId});
+}
+
 
 /* ---- استيراد نتيجة الفصل (اعتماد التسجيل القادم) ---- */
 function openImportClearanceModal(semId){
@@ -3946,11 +4215,18 @@ async function renderMyRegistration(){
   const rows = curriculumCourses.map(c=>{
     const off = offerings.find(o=>o.courseId===c.id);
     let status='ready', note='';
+    const missingPrereqs = (c.prerequisites||[]).filter(pid=> !(student.completedCourses||[]).includes(pid));
     if(!off){ status='missing'; note='لم تُضَف بعد هذه المادة لهذا الفصل الدراسي'; }
+    else if(missingPrereqs.length){
+      status='missing_prereq';
+      const names = missingPrereqs.map(pid=>{ const pc=courses.find(x=>x.id===pid); return pc?(pc.code+' — '+pc.name):pid; }).join('، ');
+      note = `لم يُسجَّل بعد كمُجتاز المتطلب السابق: ${names}`;
+    }
     return {course:c, offering:off, status, note};
   });
-  // المقررات "الجاهزة" فقط قابلة للتسجيل — أي التي أُضيفت فعلًا لهذا الفصل الدراسي،
-  // بخلاف "missing" التي لم تُضَف بعد فلا يمكن تسجيلها بأي حال.
+  // المقررات "الجاهزة" فقط قابلة للتسجيل — أي التي أُضيفت فعلًا لهذا الفصل الدراسي
+  // ولا يوجد لها متطلب سابق غير مُجتاز بعد؛ "missing" لم تُضَف بعد، و"missing_prereq"
+  // مرهونة برصد المتطلب السابق كمُجتاز في "المقررات المجتازة" بملف الطالب أولًا.
   const readyRows = rows.filter(r=>r.status==='ready');
   const totalHours = rows.filter(r=>r.status==='ready').reduce((s,r)=>s+(r.course.creditHours||0),0);
   const totalDue = (Number(sem.regFee)||0)+(Number(sem.tuitionFee)||0);
@@ -4298,6 +4574,49 @@ async function saveMyStaffInfo(){
   await addLog('تحديث بياناته الشخصية');
   ok.textContent='تم حفظ البيانات بنجاح'; ok.classList.add('show');
 }
+/* ==================== شاشة إلزامية لتغيير كلمة المرور المؤقتة (طالب) ====================
+   تظهر بدل أي شاشة أخرى (navigate يُعيد توجيه أي محاولة تصفح لهذه الشاشة طالما
+   العلَم mustChangePassword فعّال) فور أول دخول بكلمة مرور مؤقتة، ولا يزول الحجب
+   إلا بتغيير حقيقي لكلمة المرور. */
+async function renderForceChangePassword(){
+  document.getElementById('viewport').innerHTML = `
+    <div class="card" style="max-width:480px;margin:30px auto;">
+      <h2>🔐 يجب تغيير كلمة المرور المؤقتة</h2>
+      <div class="hint-box warn-box">كلمة مرورك الحالية مؤقتة (صادرة عند تسجيلك أو عند إعادة تعيينها). لأسباب أمنية، يجب عليك اختيار كلمة مرور جديدة خاصة بك قبل متابعة استخدام النظام.</div>
+      <div class="field"><label for="fc-old">كلمة المرور المؤقتة الحالية</label><input id="fc-old" type="password"></div>
+      <div class="field"><label for="fc-new">كلمة المرور الجديدة</label><input id="fc-new" type="password"></div>
+      <div class="field"><label for="fc-new2">تأكيد كلمة المرور الجديدة</label><input id="fc-new2" type="password"></div>
+      <div class="err-text" id="fc-err"></div>
+      <button class="btn btn-gold btn-block" onclick="submitForceChangePassword()">تحديث كلمة المرور والمتابعة</button>
+    </div>
+  `;
+}
+async function submitForceChangePassword(){
+  const oldPw = document.getElementById('fc-old').value;
+  const newPw = document.getElementById('fc-new').value;
+  const newPw2 = document.getElementById('fc-new2').value;
+  const err = document.getElementById('fc-err'); err.classList.remove('show');
+  const verified = await verifyStudentLogin(currentUser.id, oldPw);
+  if(!verified){ err.textContent='كلمة المرور المؤقتة الحالية غير صحيحة'; err.classList.add('show'); return; }
+  const st = validatePasswordStrength(newPw);
+  if(!st.ok){ err.textContent=st.msg; err.classList.add('show'); return; }
+  if(newPw===oldPw){ err.textContent='الرجاء اختيار كلمة مرور مختلفة عن المؤقتة'; err.classList.add('show'); return; }
+  if(newPw!==newPw2){ err.textContent='كلمتا المرور الجديدتان غير متطابقتين'; err.classList.add('show'); return; }
+  await setStudentPassword(currentUser.id, newPw, false);
+  try{
+    if(supabaseClient && navigator.onLine){
+      const { data } = await supabaseClient.auth.getUser();
+      if(data && data.user && data.user.email===emailForStudentId(currentUser.id)){
+        await withTimeout(supabaseClient.auth.updateUser({password:newPw}), 8000, 'SUPABASE_TIMEOUT');
+      }
+    }
+  }catch(e){}
+  await addLog('تغيير كلمة مرور مؤقتة إلزاميًا (أول دخول)');
+  currentUser.mustChangePassword = false;
+  toast('تم تحديث كلمة المرور بنجاح، مرحبًا بك 🎉');
+  buildNav();
+  navigate('dashboard');
+}
 async function changeMyPassword(){
   const oldPw = document.getElementById('pw-old').value;
   const newPw = document.getElementById('pw-new').value;
@@ -4311,8 +4630,8 @@ async function changeMyPassword(){
     if(!st.ok){ err.textContent=st.msg; err.classList.add('show'); return; }
     if(newPw!==newPw2){ err.textContent='كلمتا المرور الجديدتان غير متطابقتين'; err.classList.add('show'); return; }
     const user = await dbGet('users', currentUser.username);
-    const salt = genSalt();
-    user.salt = salt; user.hash = await hashPassword(newPw, salt); user.updatedAt = new Date().toISOString();
+    const rec = await makeNewPasswordRecord(newPw);
+    user.salt = rec.salt; user.hash = rec.hash; user.hashAlgo = rec.hashAlgo; user.hashIter = rec.hashIter; user.updatedAt = new Date().toISOString();
     await dbPut('users', user);
     try{
       if(supabaseClient && navigator.onLine){
@@ -4328,7 +4647,7 @@ async function changeMyPassword(){
     if(!verified){ err.textContent='كلمة المرور الحالية غير صحيحة'; err.classList.add('show'); return; }
     if(!st.ok){ err.textContent=st.msg; err.classList.add('show'); return; }
     if(newPw!==newPw2){ err.textContent='كلمتا المرور الجديدتان غير متطابقتين'; err.classList.add('show'); return; }
-    await setStudentPassword(currentUser.id, newPw);
+    await setStudentPassword(currentUser.id, newPw, false);
     // إن كانت هناك جلسة Supabase Auth نشطة لهذا الحساب بالذات، حدِّث كلمة المرور
     // هناك أيضًا فورًا (هذا هو المسار الوحيد الآمن لتحديث كلمة مرور الحساب السحابي
     // بمفتاح anon فقط — تغيير المستخدم كلمة مروره بنفسه أثناء جلسة مصادقة صحيحة).
